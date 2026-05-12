@@ -1,6 +1,7 @@
 #include <Arduino.h>
 #include <WiFi.h>
 #include <esp_now.h>
+#include <esp_wifi.h> // Required for esp_wifi_set_channel
 #include "esp_camera.h"
 
 // Include ESPNowCam and the WiFi Raw Comm Wrapper
@@ -80,7 +81,9 @@ void setup() {
 
     // --- 1. Wi-Fi & Standard ESP-NOW Init ---
     WiFi.mode(WIFI_STA);
-    WiFi.setChannel(1, WIFI_SECOND_CHAN_NONE); // MUST match Python's wlan.config(channel=1)
+    
+    // Set Wi-Fi Channel using native ESP-IDF function (Fix for compile error)
+    esp_wifi_set_channel(1, WIFI_SECOND_CHAN_NONE); 
 
     if (esp_now_init() != ESP_OK) {
         Serial.println("Error initializing ESP-NOW");
