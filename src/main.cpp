@@ -1,5 +1,9 @@
 #include <Arduino.h>
+#include <WiFi.h>
+#include <esp_now.h>
 #include "esp_camera.h"
+
+// Include ESPNowCam and the WiFi Raw Comm Wrapper
 #include <WiFiRawComm.h>
 #include <ESPNowCam.h>
 
@@ -23,19 +27,77 @@
 #define HREF_GPIO_NUM     47
 #define PCLK_GPIO_NUM     13
 
-// Instantiate WiFi Raw Communication class and pass to ESPNowCam
+// Instantiate WiFi Raw Communication for the camera
 WiFiRawComm wifiRaw;
 ESPNowCam radio(&wifiRaw);
 
-// Replace with your receiver's MAC address to improve quality 
-// (For WiFi Raw broadcast, you can usually leave this empty, but setting the target improves packet delivery).
-const uint8_t macRecv[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+// Connection state variables
+uint8_t pyControllerMac[6];
+volatile bool isConnected = false;
+
+// ----------------------------------------------------
+// ESP-NOW Receive Callback (Listens for Handshake / Controls)
+// ----------------------------------------------------
+void onDataRecv(const uint8_t *mac, const uint8_t *incomingData, int len) {
+    // 1. Handshake Phase: Listen for MicroPython broadcast
+    if (!isConnected && len >= 14 && strncmp((const char*)incomingData, "pyCAR_DISCOVER", 14) == 0) {
+        Serial.println("Received 'pyCAR_DISCOVER' via ESP-NOW!");
+        memcpy(pyControllerMac, mac, 6);
+        
+        // Register the PyController to send replies
+        esp_now_peer_info_t peerInfo = {};
+        memcpy(peerInfo.peer_addr, pyControllerMac, 6);
+        peerInfo.channel = 1; // Channel must match python script
+        peerInfo.encrypt = false;
+        
+        if (!esp_now_is_peer_exist(pyControllerMac)) {
+            esp_now_add_peer(&peerInfo);
+        }
+
+        // Send ACK back via standard ESP-NOW
+        const char* ackMsg = "pyCAR_ACK";
+        esp_now_send(pyControllerMac, (uint8_t *)ackMsg, strlen(ackMsg));
+        
+        Serial.println("Sent 'pyCAR_ACK' via ESP-NOW. Proceeding to boot camera!");
+        isConnected = true;
+    } 
+    // 2. Control Phase: Listen for standard ESP-NOW joystick data
+    else if (isConnected && len == 6 && incomingData[0] == 67) {
+        // incomingData contains your struct.pack('<BBBBBB', 67, key[1], ...)
+        uint8_t joyL_x = incomingData[1];
+        uint8_t joyL_y = incomingData[2];
+        uint8_t joyR_x = incomingData[3];
+        uint8_t joyR_y = incomingData[4];
+        uint8_t buttons = incomingData[5];
+        
+        // E.g., apply motor speeds here
+    }
+}
 
 void setup() {
     Serial.begin(115200);
     delay(1000);
 
-    // 1. Camera Initialization
+    // --- 1. Wi-Fi & Standard ESP-NOW Init ---
+    WiFi.mode(WIFI_STA);
+    WiFi.setChannel(1, WIFI_SECOND_CHAN_NONE); // MUST match Python's wlan.config(channel=1)
+
+    if (esp_now_init() != ESP_OK) {
+        Serial.println("Error initializing ESP-NOW");
+        return;
+    }
+
+    // Register callback for auto-connection
+    esp_now_register_recv_cb(onDataRecv);
+
+    Serial.println("Waiting for PyController to broadcast 'pyCAR_DISCOVER'...");
+    
+    // Block execution until we perform the ESP-NOW handshake
+    while (!isConnected) {
+        delay(100);
+    }
+
+    // --- 2. Camera Initialization ---
     camera_config_t config;
     config.ledc_channel = LEDC_CHANNEL_0;
     config.ledc_timer   = LEDC_TIMER_0;
@@ -57,44 +119,37 @@ void setup() {
     config.pin_reset    = RESET_GPIO_NUM;
 
     config.xclk_freq_hz = 20000000;
-    config.pixel_format = PIXFORMAT_JPEG; // MJPEG Output
-    
-    // Set strictly to 320x240 for your LCD 
-    config.frame_size = FRAMESIZE_QVGA;  
-    
-    // Compression quality: 10-15 is typically good (lower number = higher quality/size)
-    config.jpeg_quality = 12; 
-    config.fb_count = 2; // Requires BOARD_HAS_PSRAM defined in build flags
-    config.grab_mode = CAMERA_GRAB_LATEST;
+    config.pixel_format = PIXFORMAT_JPEG; // Required for MJPEG
+    config.frame_size   = FRAMESIZE_QVGA; // Exactly 320x240 to fit your LCD
+    config.jpeg_quality = 12; // Lower = higher quality
+    config.fb_count     = 2;  // Requires PSRAM flag in PlatformIO
+    config.grab_mode    = CAMERA_GRAB_LATEST;
 
-    // Init the camera
-    esp_err_t err = esp_camera_init(&config);
-    if (err != ESP_OK) {
-        Serial.printf("Camera Init Failed with error 0x%x\n", err);
+    if (esp_camera_init(&config) != ESP_OK) {
+        Serial.println("Camera Init Failed");
         return;
     }
-    Serial.println("Camera initialized successfully!");
+    Serial.println("Camera initialized!");
 
-    // 2. ESPNowCam Initialization over WiFi-Raw (802.11tx)
-    radio.setTarget((uint8_t*)macRecv); // Sets receiver MAC address
-    radio.setChannel(6);                // Channel to match with receiver (important!)
-    radio.init(512);                    // 512 bytes is the standard recommended chunk size
+    // --- 3. Start WiFi Raw Comm for Video Streaming ---
+    // WiFi Raw supports much larger packets than ESP-NOW. 512 or 1000 bytes works great.
+    radio.setTarget(pyControllerMac); // Address the Raw frames to your PyController MAC
+    radio.setChannel(1);              // Keep it on the same Wi-Fi channel
+    radio.init(512);                  // 512 Byte payload chunks
     
-    Serial.println("ESPNowCam WiFi-Raw mode started.");
+    Serial.println("Video Streaming via Raw 802.11tx Started.");
 }
 
 void loop() {
-    // Acquire a new MJPEG frame buffer
-    camera_fb_t *fb = esp_camera_fb_get();
-    
-    if (!fb) {
-        Serial.println("Camera capture failed");
-        return;
+    if (isConnected) {
+        // Capture frame from OV2640
+        camera_fb_t *fb = esp_camera_fb_get();
+        if (fb) {
+            // Push high-bandwidth MJPEG data via RAW WiFi frames (Not ESP-NOW)
+            radio.sendData(fb->buf, fb->len);
+            
+            // Return buffer to the DMA
+            esp_camera_fb_return(fb);
+        }
     }
-
-    // Send raw MJPEG buffer over WiFi Raw
-    radio.sendData(fb->buf, fb->len);
-    
-    // Return frame buffer so the DMA can reuse it
-    esp_camera_fb_return(fb);
 }
