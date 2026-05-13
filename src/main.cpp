@@ -41,69 +41,50 @@ volatile bool isConnected = false;
 // ESP-NOW Receive Callback (Listens for Handshake / Controls)
 // ----------------------------------------------------
 void onDataRecv(const uint8_t *mac, const uint8_t *incomingData, int len) {
-    // 1. Handshake Phase: Listen for MicroPython/C++ broadcast
     if (!isConnected && len >= 14 && strncmp((const char*)incomingData, "pyCAR_DISCOVER", 14) == 0) {
         Serial.println("Received 'pyCAR_DISCOVER' via ESP-NOW!");
         memcpy(pyControllerMac, mac, 6);
         
-        // Register the PyController to send replies
         esp_now_peer_info_t peerInfo = {};
         memcpy(peerInfo.peer_addr, pyControllerMac, 6);
-        peerInfo.channel = 1; // Channel must match controller
+        peerInfo.channel = 1; 
         peerInfo.encrypt = false;
         
         if (!esp_now_is_peer_exist(pyControllerMac)) {
             esp_now_add_peer(&peerInfo);
         }
 
-        // Send ACK back via standard ESP-NOW identifying as the Camera
         const char* ackMsg = "pyCAM_ACK";
         esp_now_send(pyControllerMac, (uint8_t *)ackMsg, strlen(ackMsg));
         
         Serial.println("Sent 'pyCAM_ACK' via ESP-NOW. Proceeding to boot camera!");
         isConnected = true;
     } 
-    // 2. Control Phase: Listen for standard ESP-NOW joystick data
-    else if (isConnected && len == 6 && incomingData[0] == 67) {
-        // incomingData contains your struct.pack('<BBBBBB', 67, key[1], ...)
-        uint8_t joyL_x = incomingData[1];
-        uint8_t joyL_y = incomingData[2];
-        uint8_t joyR_x = incomingData[3];
-        uint8_t joyR_y = incomingData[4];
-        uint8_t buttons = incomingData[5];
-        
-        // E.g., apply pan/tilt servo speeds here if needed in the future
-    }
 }
 
 void setup() {
     Serial.begin(115200);
     delay(1000);
 
-    // --- 1. Wi-Fi & Standard ESP-NOW Init ---
-    
-    // Initialize RAW WiFi Communication FIRST. (This sets up the ESP-IDF WiFi layer internally).
-    // Removing Arduino's WiFi.mode() prevents duplicate esp_netif initialization crashes.
+    // --- 1. Wi-Fi & ESP-NOW Init ---
+    // The ESPNowCam/WiFiRawComm library handles all WiFi initialization internally.
+    // Calling Arduino's WiFi.mode() here will cause a duplicate netif crash.
     radio.init(512); 
     radio.setChannel(1);
     
-    // Now that the WiFi interface is active, we can initialize ESP-NOW
     if (esp_now_init() != ESP_OK) {
         Serial.println("Error initializing ESP-NOW");
         return;
     }
 
-    // Register callback for auto-connection
     esp_now_register_recv_cb(onDataRecv);
 
     Serial.println("Waiting for PyController to broadcast 'pyCAR_DISCOVER'...");
     
-    // Block execution until we perform the ESP-NOW handshake
     while (!isConnected) {
         delay(100);
     }
 
-    // Once connected, set the target MAC for the RAW 802.11 video streaming frames
     radio.setTarget(pyControllerMac);
 
     // --- 2. Camera Initialization ---
@@ -128,10 +109,10 @@ void setup() {
     config.pin_reset    = RESET_GPIO_NUM;
 
     config.xclk_freq_hz = 20000000;
-    config.pixel_format = PIXFORMAT_JPEG; // Required for MJPEG
-    config.frame_size   = FRAMESIZE_QVGA; // Exactly 320x240
-    config.jpeg_quality = 12; // Lower = higher quality
-    config.fb_count     = 2;  // Requires PSRAM flag in PlatformIO
+    config.pixel_format = PIXFORMAT_JPEG;
+    config.frame_size   = FRAMESIZE_QVGA; 
+    config.jpeg_quality = 12; 
+    config.fb_count     = 2;  
     config.grab_mode    = CAMERA_GRAB_LATEST;
 
     if (esp_camera_init(&config) != ESP_OK) {
@@ -144,13 +125,9 @@ void setup() {
 
 void loop() {
     if (isConnected) {
-        // Capture frame from OV2640
         camera_fb_t *fb = esp_camera_fb_get();
         if (fb) {
-            // Push high-bandwidth MJPEG data via RAW WiFi frames (Not ESP-NOW)
             radio.sendData(fb->buf, fb->len);
-            
-            // Return buffer to the DMA
             esp_camera_fb_return(fb);
         }
     }
