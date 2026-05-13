@@ -1,7 +1,7 @@
 #include <Arduino.h>
 #include <WiFi.h>
 #include <esp_now.h>
-#include <esp_wifi.h> // Required for esp_wifi_set_channel
+#include <esp_wifi.h>
 #include "esp_camera.h"
 
 // Include ESPNowCam and the WiFi Raw Comm Wrapper
@@ -40,7 +40,7 @@ volatile bool isConnected = false;
 // ESP-NOW Receive Callback (Listens for Handshake / Controls)
 // ----------------------------------------------------
 void onDataRecv(const uint8_t *mac, const uint8_t *incomingData, int len) {
-    // 1. Handshake Phase: Listen for MicroPython broadcast
+    // 1. Handshake Phase: Listen for MicroPython/C++ broadcast
     if (!isConnected && len >= 14 && strncmp((const char*)incomingData, "pyCAR_DISCOVER", 14) == 0) {
         Serial.println("Received 'pyCAR_DISCOVER' via ESP-NOW!");
         memcpy(pyControllerMac, mac, 6);
@@ -48,18 +48,18 @@ void onDataRecv(const uint8_t *mac, const uint8_t *incomingData, int len) {
         // Register the PyController to send replies
         esp_now_peer_info_t peerInfo = {};
         memcpy(peerInfo.peer_addr, pyControllerMac, 6);
-        peerInfo.channel = 1; // Channel must match python script
+        peerInfo.channel = 1; // Channel must match controller
         peerInfo.encrypt = false;
         
         if (!esp_now_is_peer_exist(pyControllerMac)) {
             esp_now_add_peer(&peerInfo);
         }
 
-        // Send ACK back via standard ESP-NOW
-        const char* ackMsg = "pyCAR_ACK";
+        // Send ACK back via standard ESP-NOW identifying as the Camera
+        const char* ackMsg = "pyCAM_ACK";
         esp_now_send(pyControllerMac, (uint8_t *)ackMsg, strlen(ackMsg));
         
-        Serial.println("Sent 'pyCAR_ACK' via ESP-NOW. Proceeding to boot camera!");
+        Serial.println("Sent 'pyCAM_ACK' via ESP-NOW. Proceeding to boot camera!");
         isConnected = true;
     } 
     // 2. Control Phase: Listen for standard ESP-NOW joystick data
@@ -71,7 +71,7 @@ void onDataRecv(const uint8_t *mac, const uint8_t *incomingData, int len) {
         uint8_t joyR_y = incomingData[4];
         uint8_t buttons = incomingData[5];
         
-        // E.g., apply motor speeds here
+        // E.g., apply pan/tilt servo speeds here if needed in the future
     }
 }
 
@@ -80,11 +80,14 @@ void setup() {
     delay(1000);
 
     // --- 1. Wi-Fi & Standard ESP-NOW Init ---
-    WiFi.mode(WIFI_STA);
     
-    // Set Wi-Fi Channel using native ESP-IDF function (Fix for compile error)
-    esp_wifi_set_channel(1, WIFI_SECOND_CHAN_NONE); 
-
+    // Initialize the WiFiRawComm stack FIRST. This handles the ESP-IDF WiFi setup
+    // internally. Removing Arduino's `WiFi.mode(WIFI_STA)` prevents the duplicate 
+    // `esp_netif_create_default_wifi_sta` crash!
+    radio.init(512); 
+    radio.setChannel(1);
+    
+    // Now that the WiFi interface is active, we can initialize ESP-NOW
     if (esp_now_init() != ESP_OK) {
         Serial.println("Error initializing ESP-NOW");
         return;
@@ -99,6 +102,9 @@ void setup() {
     while (!isConnected) {
         delay(100);
     }
+
+    // Once connected, set the target MAC for the RAW 802.11 video streaming frames
+    radio.setTarget(pyControllerMac);
 
     // --- 2. Camera Initialization ---
     camera_config_t config;
@@ -123,7 +129,7 @@ void setup() {
 
     config.xclk_freq_hz = 20000000;
     config.pixel_format = PIXFORMAT_JPEG; // Required for MJPEG
-    config.frame_size   = FRAMESIZE_QVGA; // Exactly 320x240 to fit your LCD
+    config.frame_size   = FRAMESIZE_QVGA; // Exactly 320x240
     config.jpeg_quality = 12; // Lower = higher quality
     config.fb_count     = 2;  // Requires PSRAM flag in PlatformIO
     config.grab_mode    = CAMERA_GRAB_LATEST;
@@ -133,13 +139,6 @@ void setup() {
         return;
     }
     Serial.println("Camera initialized!");
-
-    // --- 3. Start WiFi Raw Comm for Video Streaming ---
-    // WiFi Raw supports much larger packets than ESP-NOW. 512 or 1000 bytes works great.
-    radio.setTarget(pyControllerMac); // Address the Raw frames to your PyController MAC
-    radio.setChannel(1);              // Keep it on the same Wi-Fi channel
-    radio.init(512);                  // 512 Byte payload chunks
-    
     Serial.println("Video Streaming via Raw 802.11tx Started.");
 }
 
