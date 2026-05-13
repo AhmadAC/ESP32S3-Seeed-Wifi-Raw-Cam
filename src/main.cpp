@@ -1,4 +1,4 @@
-// src\main.cpp
+// src/main.cpp
 #include <Arduino.h>
 #include <WiFi.h>
 #include <esp_now.h>
@@ -82,14 +82,8 @@ void setup() {
 
     // --- 1. Wi-Fi & Standard ESP-NOW Init ---
     
-    // Properly initialize WiFi first to prevent netif crashes.
-    // Disabling AutoConnect prevents background tasks from triggering duplicate netif creations.
-    WiFi.mode(WIFI_STA);
-    WiFi.setAutoConnect(false); 
-    WiFi.disconnect();
-    esp_wifi_set_channel(1, WIFI_SECOND_CHAN_NONE);
-
-    // Initialize RAW WiFi Communication
+    // Initialize RAW WiFi Communication FIRST. (This sets up the ESP-IDF WiFi layer internally).
+    // Removing Arduino's WiFi.mode() prevents duplicate esp_netif initialization crashes.
     radio.init(512); 
     radio.setChannel(1);
     
