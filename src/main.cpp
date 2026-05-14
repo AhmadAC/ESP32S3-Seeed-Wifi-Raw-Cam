@@ -2,6 +2,7 @@
 #include <Arduino.h>
 #include <WiFi.h>
 #include <esp_now.h>
+#include <esp_wifi.h> // Required for esp_wifi_set_channel
 #include "esp_camera.h"
 
 // ----------------------------------------------------
@@ -62,7 +63,9 @@ void setup() {
 
     // --- 1. Wi-Fi & ESP-NOW Init ---
     WiFi.mode(WIFI_STA);
-    WiFi.setChannel(1);
+    
+    // Use native ESP-IDF API to set the Wi-Fi channel securely
+    esp_wifi_set_channel(1, WIFI_SECOND_CHAN_NONE);
     
     if (esp_now_init() != ESP_OK) {
         Serial.println("Error initializing ESP-NOW");
