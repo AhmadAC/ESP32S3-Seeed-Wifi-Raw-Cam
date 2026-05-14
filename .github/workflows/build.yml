@@ -1,6 +1,6 @@
 name: Compile Xiao ESP32S3 Firmware
 
-on: [push, pull_request]
+on: [espnow, pull_request]
 
 jobs:
   build:

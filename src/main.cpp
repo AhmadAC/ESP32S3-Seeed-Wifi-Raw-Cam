@@ -2,12 +2,7 @@
 #include <Arduino.h>
 #include <WiFi.h>
 #include <esp_now.h>
-#include <esp_wifi.h>
 #include "esp_camera.h"
-
-// Include ESPNowCam and the WiFi Raw Comm Wrapper
-#include <WiFiRawComm.h>
-#include <ESPNowCam.h>
 
 // ----------------------------------------------------
 // Seeed Studio XIAO ESP32S3 Sense OV2640 Pinout
@@ -29,37 +24,36 @@
 #define HREF_GPIO_NUM     47
 #define PCLK_GPIO_NUM     13
 
-// Instantiate WiFi Raw Communication for the camera
-WiFiRawComm wifiRaw;
-ESPNowCam radio(&wifiRaw);
-
-// Connection state variables
 uint8_t pyControllerMac[6];
 volatile bool isConnected = false;
+volatile bool captureRequested = false;
 
 // ----------------------------------------------------
 // ESP-NOW Receive Callback (Listens for Handshake / Controls)
 // ----------------------------------------------------
 void onDataRecv(const uint8_t *mac, const uint8_t *incomingData, int len) {
-    if (!isConnected && len >= 14 && strncmp((const char*)incomingData, "pyCAR_DISCOVER", 14) == 0) {
-        Serial.println("Received 'pyCAR_DISCOVER' via ESP-NOW!");
-        memcpy(pyControllerMac, mac, 6);
-        
-        esp_now_peer_info_t peerInfo = {};
-        memcpy(peerInfo.peer_addr, pyControllerMac, 6);
-        peerInfo.channel = 1; 
-        peerInfo.encrypt = false;
-        
-        if (!esp_now_is_peer_exist(pyControllerMac)) {
-            esp_now_add_peer(&peerInfo);
+    if (len >= 14 && strncmp((const char*)incomingData, "pyCAR_DISCOVER", 14) == 0) {
+        if (!isConnected) {
+            Serial.println("Received 'pyCAR_DISCOVER' via ESP-NOW!");
+            memcpy(pyControllerMac, mac, 6);
+            
+            esp_now_peer_info_t peerInfo = {};
+            memcpy(peerInfo.peer_addr, pyControllerMac, 6);
+            peerInfo.channel = 1; 
+            peerInfo.encrypt = false;
+            
+            if (!esp_now_is_peer_exist(pyControllerMac)) {
+                esp_now_add_peer(&peerInfo);
+            }
+            isConnected = true;
         }
-
+        
         const char* ackMsg = "pyCAM_ACK";
         esp_now_send(pyControllerMac, (uint8_t *)ackMsg, strlen(ackMsg));
-        
-        Serial.println("Sent 'pyCAM_ACK' via ESP-NOW. Proceeding to boot camera!");
-        isConnected = true;
     } 
+    else if (len >= 9 && strncmp((const char*)incomingData, "pyCAM_REQ", 9) == 0) {
+        captureRequested = true;
+    }
 }
 
 void setup() {
@@ -67,10 +61,8 @@ void setup() {
     delay(1000);
 
     // --- 1. Wi-Fi & ESP-NOW Init ---
-    // The ESPNowCam/WiFiRawComm library handles all WiFi initialization internally.
-    // Calling Arduino's WiFi.mode() here will cause a duplicate netif crash.
-    radio.init(512); 
-    radio.setChannel(1);
+    WiFi.mode(WIFI_STA);
+    WiFi.setChannel(1);
     
     if (esp_now_init() != ESP_OK) {
         Serial.println("Error initializing ESP-NOW");
@@ -78,14 +70,7 @@ void setup() {
     }
 
     esp_now_register_recv_cb(onDataRecv);
-
     Serial.println("Waiting for PyController to broadcast 'pyCAR_DISCOVER'...");
-    
-    while (!isConnected) {
-        delay(100);
-    }
-
-    radio.setTarget(pyControllerMac);
 
     // --- 2. Camera Initialization ---
     camera_config_t config;
@@ -120,15 +105,37 @@ void setup() {
         return;
     }
     Serial.println("Camera initialized!");
-    Serial.println("Video Streaming via Raw 802.11tx Started.");
 }
 
 void loop() {
-    if (isConnected) {
+    if (captureRequested && isConnected) {
+        captureRequested = false;
         camera_fb_t *fb = esp_camera_fb_get();
         if (fb) {
-            radio.sendData(fb->buf, fb->len);
+            // Fragment JPEG payload sequentially across standard ESP-NOW Packets
+            int max_payload = 230; 
+            uint16_t total_chunks = (fb->len + max_payload - 1) / max_payload;
+            
+            for (uint16_t i = 0; i < total_chunks; i++) {
+                uint8_t packet[250];
+                packet[0] = 'C';
+                packet[1] = 'I';
+                memcpy(&packet[2], &i, 2);
+                memcpy(&packet[4], &total_chunks, 2);
+                
+                int offset = i * max_payload;
+                uint16_t len = fb->len - offset;
+                if (len > max_payload) len = max_payload;
+                
+                memcpy(&packet[6], &len, 2);
+                memcpy(&packet[8], fb->buf + offset, len);
+                
+                esp_now_send(pyControllerMac, packet, 8 + len);
+                delay(5); // Prevents buffer overflow causing packet drop!
+            }
             esp_camera_fb_return(fb);
+            Serial.println("Image chunks sent successfully!");
         }
     }
+    delay(10);
 }
