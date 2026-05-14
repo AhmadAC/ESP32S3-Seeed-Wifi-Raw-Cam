@@ -1,4 +1,4 @@
-// src/main.cpp
+// ESP32S3-Seeed-Wifi-Raw-Cam\src\main.cpp
 #include <Arduino.h>
 #include <WiFi.h>
 #include <esp_now.h>
@@ -28,6 +28,7 @@
 uint8_t pyControllerMac[6];
 volatile bool isConnected = false;
 volatile bool captureRequested = false;
+volatile bool is_streaming = false;
 
 // ----------------------------------------------------
 // ESP-NOW Receive Callback (Listens for Handshake / Controls)
@@ -55,13 +56,19 @@ void onDataRecv(const uint8_t *mac, const uint8_t *incomingData, int len) {
     else if (len >= 9 && strncmp((const char*)incomingData, "pyCAM_REQ", 9) == 0) {
         captureRequested = true;
     }
+    else if (len >= 11 && strncmp((const char*)incomingData, "pyCAM_STR_1", 11) == 0) {
+        is_streaming = true;
+    }
+    else if (len >= 11 && strncmp((const char*)incomingData, "pyCAM_STR_0", 11) == 0) {
+        is_streaming = false;
+    }
 }
 
 void setup() {
     Serial.begin(115200);
     delay(1000);
 
-    // --- 1. Wi-Fi & ESP-NOW Init ---
+    // ---  1. Wi-Fi & ESP-NOW Init ---
     WiFi.mode(WIFI_STA);
     
     // Use native ESP-IDF API to set the Wi-Fi channel securely
@@ -111,7 +118,7 @@ void setup() {
 }
 
 void loop() {
-    if (captureRequested && isConnected) {
+    if ((captureRequested || is_streaming) && isConnected) {
         captureRequested = false;
         camera_fb_t *fb = esp_camera_fb_get();
         if (fb) {
@@ -134,10 +141,9 @@ void loop() {
                 memcpy(&packet[8], fb->buf + offset, len);
                 
                 esp_now_send(pyControllerMac, packet, 8 + len);
-                delay(5); // Prevents buffer overflow causing packet drop!
+                delay(3); // Prevents buffer overflow causing packet drop!
             }
             esp_camera_fb_return(fb);
-            Serial.println("Image chunks sent successfully!");
         }
     }
     delay(10);
