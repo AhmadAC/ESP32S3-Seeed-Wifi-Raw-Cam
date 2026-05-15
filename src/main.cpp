@@ -31,16 +31,13 @@ volatile bool isConnected = false;
 volatile bool captureRequested = false;
 volatile bool is_streaming = false;
 
-// Optional: Throttle debug logs to avoid flooding the REPL
-uint32_t frameCount = 0;
-
 // ----------------------------------------------------
 // ESP-NOW Receive Callback (Listens for Handshake / Controls)
 // ----------------------------------------------------
 void onDataRecv(const uint8_t *mac, const uint8_t *incomingData, int len) {
     if (len >= 14 && strncmp((const char*)incomingData, "pyCAR_DISCOVER", 14) == 0) {
         if (!isConnected) {
-            Serial.printf("Received 'pyCAR_DISCOVER' via ESP-NOW from %02X:%02X:%02X:%02X:%02X:%02X\n", 
+            Serial.printf("Received 'pyCAR_DISCOVER' via ESP-NOW from %02X:%02X:%02X:%02X:%02X:%02X\n",
                           mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
             memcpy(pyControllerMac, mac, 6);
             
@@ -61,21 +58,21 @@ void onDataRecv(const uint8_t *mac, const uint8_t *incomingData, int len) {
     } 
     else if (len >= 9 && strncmp((const char*)incomingData, "pyCAM_REQ", 9) == 0) {
         captureRequested = true;
-        Serial.println("Single capture requested.");
     }
     else if (len >= 11 && strncmp((const char*)incomingData, "pyCAM_STR_1", 11) == 0) {
+        if (!is_streaming) Serial.println("Stream START requested.");
         is_streaming = true;
-        Serial.println("Stream START requested.");
     }
     else if (len >= 11 && strncmp((const char*)incomingData, "pyCAM_STR_0", 11) == 0) {
+        if (is_streaming) Serial.println("Stream STOP requested.");
         is_streaming = false;
-        Serial.println("Stream STOP requested.");
     }
 }
 
 void setup() {
     Serial.begin(115200);
-    delay(1000); // Wait for REPL to connect
+    delay(1000);
+
     Serial.println("\n--- PyCAM Booting ---");
 
     // ---  1. Wi-Fi & ESP-NOW Init ---
@@ -87,12 +84,11 @@ void setup() {
     
     // Store camera MAC for raw packet injection
     esp_wifi_get_mac(WIFI_IF_STA, cam_mac);
-    
-    Serial.printf("Camera MAC: %02X:%02X:%02X:%02X:%02X:%02X\n",
+    Serial.printf("Camera MAC: %02X:%02X:%02X:%02X:%02X:%02X\n", 
                   cam_mac[0], cam_mac[1], cam_mac[2], cam_mac[3], cam_mac[4], cam_mac[5]);
     
     if (esp_now_init() != ESP_OK) {
-        Serial.println("CRITICAL ERROR: Failed to initialize ESP-NOW");
+        Serial.println("Error initializing ESP-NOW");
         return;
     }
 
@@ -128,7 +124,7 @@ void setup() {
     config.grab_mode    = CAMERA_GRAB_LATEST;
 
     if (esp_camera_init(&config) != ESP_OK) {
-        Serial.println("CRITICAL ERROR: Camera Init Failed!");
+        Serial.println("Camera Init Failed");
         return;
     }
     Serial.println("Camera initialized successfully.");
@@ -145,18 +141,9 @@ void setup() {
 void loop() {
     if ((captureRequested || is_streaming) && isConnected) {
         captureRequested = false;
-        
         camera_fb_t *fb = esp_camera_fb_get();
-        if (!fb) {
-            Serial.println("Error: Failed to capture camera frame");
-            delay(100);
-            return;
-        }
-
-        if (fb->len > 0 && fb->buf != nullptr) {
-            // Make raw_packet static so it is placed in the BSS segment, 
-            // NOT the loop stack. This prevents Stack Overflow crashes!
-            static uint8_t raw_packet[1400];
+        if (fb) {
+            uint8_t raw_packet[1400];
             
             // 802.11 MAC Header (24 bytes)
             raw_packet[0] = 0x08; // Data frame
@@ -174,14 +161,9 @@ void loop() {
             raw_packet[25] = 'A';
             raw_packet[26] = 'M';
             
-            // Maximum payload that comfortably fits in standard 802.11 MTU
+            // Maximum payload that comfortably fits in 802.11 frame
             int max_payload = 1300; 
             uint16_t total_chunks = (fb->len + max_payload - 1) / max_payload;
-            
-            // Print every ~30 frames to avoid flooding REPL, but show it's working
-            if (frameCount++ % 30 == 0) {
-                Serial.printf("Sending frame: %u bytes in %u chunks\n", fb->len, total_chunks);
-            }
             
             for (uint16_t i = 0; i < total_chunks; i++) {
                 memcpy(&raw_packet[27], &i, 2);
@@ -194,23 +176,29 @@ void loop() {
                 memcpy(&raw_packet[31], &len, 2);
                 memcpy(&raw_packet[33], fb->buf + offset, len);
                 
-                // Inject raw 802.11 packet to achieve massive throughput increase
-                esp_err_t err = esp_wifi_80211_tx(WIFI_IF_STA, raw_packet, 33 + len, false);
-                if (err != ESP_OK) {
-                    Serial.printf("Raw TX failed on chunk %d! Error: %d\n", i, err);
-                }
+                // Inject raw 802.11 packet
+                // ESP_ERR_NO_MEM (257) occurs if the hardware Wi-Fi TX Ring Buffer is full.
+                esp_err_t err;
+                int retries = 0;
+                do {
+                    err = esp_wifi_80211_tx(WIFI_IF_STA, raw_packet, 33 + len, false);
+                    if (err != ESP_OK) {
+                        // Crucial: delay() yields CPU to the FreeRTOS Wi-Fi task to empty the TX buffer!
+                        // delayMicroseconds() blocks the CPU and causes the buffer to stay full forever.
+                        delay(2); 
+                        retries++;
+                    }
+                } while (err != ESP_OK && retries < 15);
                 
-                // CRITICAL: Must use `delay()` (not delayMicroseconds) so the 
-                // FreeRTOS idle task can feed the watchdog and process the WiFi TX queue.
-                delay(2); 
+                if (err != ESP_OK) {
+                    Serial.printf("Raw TX completely failed on chunk %d! Error: %d\n", i, err);
+                }
+
+                // Small yield to prevent starving the Wi-Fi background task between successful chunks
+                delay(1); 
             }
-        } else {
-            Serial.println("Warning: Empty frame buffer captured.");
+            esp_camera_fb_return(fb);
         }
-        
-        // ALWAYS return the frame buffer to prevent memory exhaustion
-        esp_camera_fb_return(fb);
     }
-    
     delay(5);
 }
