@@ -2,7 +2,7 @@
 #include <Arduino.h>
 #include <WiFi.h>
 #include <esp_now.h>
-#include <esp_wifi.h> 
+#include <esp_wifi.h> // Required for esp_wifi_set_channel and esp_wifi_80211_tx
 #include "esp_camera.h"
 
 // ----------------------------------------------------
@@ -26,12 +26,13 @@
 #define PCLK_GPIO_NUM     13
 
 uint8_t pyControllerMac[6];
-uint8_t myMac[6];
+uint8_t cam_mac[6];
 volatile bool isConnected = false;
 volatile bool captureRequested = false;
 volatile bool is_streaming = false;
 
-static uint16_t raw_seq = 0;
+// Optional: Throttle debug logs to avoid flooding the REPL
+uint32_t frameCount = 0;
 
 // ----------------------------------------------------
 // ESP-NOW Receive Callback (Listens for Handshake / Controls)
@@ -39,7 +40,8 @@ static uint16_t raw_seq = 0;
 void onDataRecv(const uint8_t *mac, const uint8_t *incomingData, int len) {
     if (len >= 14 && strncmp((const char*)incomingData, "pyCAR_DISCOVER", 14) == 0) {
         if (!isConnected) {
-            Serial.println("Received 'pyCAR_DISCOVER' via ESP-NOW!");
+            Serial.printf("Received 'pyCAR_DISCOVER' via ESP-NOW from %02X:%02X:%02X:%02X:%02X:%02X\n", 
+                          mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
             memcpy(pyControllerMac, mac, 6);
             
             esp_now_peer_info_t peerInfo = {};
@@ -51,6 +53,7 @@ void onDataRecv(const uint8_t *mac, const uint8_t *incomingData, int len) {
                 esp_now_add_peer(&peerInfo);
             }
             isConnected = true;
+            Serial.println("PyController Connected!");
         }
         
         const char* ackMsg = "pyCAM_ACK";
@@ -58,28 +61,38 @@ void onDataRecv(const uint8_t *mac, const uint8_t *incomingData, int len) {
     } 
     else if (len >= 9 && strncmp((const char*)incomingData, "pyCAM_REQ", 9) == 0) {
         captureRequested = true;
+        Serial.println("Single capture requested.");
     }
     else if (len >= 11 && strncmp((const char*)incomingData, "pyCAM_STR_1", 11) == 0) {
         is_streaming = true;
+        Serial.println("Stream START requested.");
     }
     else if (len >= 11 && strncmp((const char*)incomingData, "pyCAM_STR_0", 11) == 0) {
         is_streaming = false;
+        Serial.println("Stream STOP requested.");
     }
 }
 
 void setup() {
     Serial.begin(115200);
-    delay(1000);
+    delay(1000); // Wait for REPL to connect
+    Serial.println("\n--- PyCAM Booting ---");
 
     // ---  1. Wi-Fi & ESP-NOW Init ---
     WiFi.mode(WIFI_STA);
-    esp_read_mac(myMac, ESP_MAC_WIFI_STA);
+    WiFi.setSleep(false); // Disable sleep mode to prevent WiFi queuing/latency
     
     // Use native ESP-IDF API to set the Wi-Fi channel securely
     esp_wifi_set_channel(1, WIFI_SECOND_CHAN_NONE);
     
+    // Store camera MAC for raw packet injection
+    esp_wifi_get_mac(WIFI_IF_STA, cam_mac);
+    
+    Serial.printf("Camera MAC: %02X:%02X:%02X:%02X:%02X:%02X\n",
+                  cam_mac[0], cam_mac[1], cam_mac[2], cam_mac[3], cam_mac[4], cam_mac[5]);
+    
     if (esp_now_init() != ESP_OK) {
-        Serial.println("Error initializing ESP-NOW");
+        Serial.println("CRITICAL ERROR: Failed to initialize ESP-NOW");
         return;
     }
 
@@ -115,63 +128,89 @@ void setup() {
     config.grab_mode    = CAMERA_GRAB_LATEST;
 
     if (esp_camera_init(&config) != ESP_OK) {
-        Serial.println("Camera Init Failed");
+        Serial.println("CRITICAL ERROR: Camera Init Failed!");
         return;
     }
-    Serial.println("Camera initialized!");
+    Serial.println("Camera initialized successfully.");
+
+    // --- 3. Flip the Image Hardware-Side ---
+    sensor_t * s = esp_camera_sensor_get();
+    if (s != NULL) {
+        s->set_vflip(s, 1);   // 1 = Flip vertically
+        s->set_hmirror(s, 1); // 1 = Mirror horizontally
+        Serial.println("Hardware image flip applied.");
+    }
 }
 
 void loop() {
     if ((captureRequested || is_streaming) && isConnected) {
         captureRequested = false;
+        
         camera_fb_t *fb = esp_camera_fb_get();
-        if (fb) {
-            // Fragment JPEG payload sequentially across massive RAW Wi-Fi Frames
-            int max_payload = 1000; 
+        if (!fb) {
+            Serial.println("Error: Failed to capture camera frame");
+            delay(100);
+            return;
+        }
+
+        if (fb->len > 0 && fb->buf != nullptr) {
+            // Make raw_packet static so it is placed in the BSS segment, 
+            // NOT the loop stack. This prevents Stack Overflow crashes!
+            static uint8_t raw_packet[1400];
+            
+            // 802.11 MAC Header (24 bytes)
+            raw_packet[0] = 0x08; // Data frame
+            raw_packet[1] = 0x00;
+            raw_packet[2] = 0x00; // Duration
+            raw_packet[3] = 0x00;
+            memcpy(&raw_packet[4], pyControllerMac, 6);  // Addr1 (Dest)
+            memcpy(&raw_packet[10], cam_mac, 6);         // Addr2 (Src)
+            memcpy(&raw_packet[16], pyControllerMac, 6); // Addr3 (BSSID)
+            raw_packet[22] = 0x00; // Seq Ctrl
+            raw_packet[23] = 0x00;
+
+            // Custom Payload Header (Match PyController expectation)
+            raw_packet[24] = 'C';
+            raw_packet[25] = 'A';
+            raw_packet[26] = 'M';
+            
+            // Maximum payload that comfortably fits in standard 802.11 MTU
+            int max_payload = 1300; 
             uint16_t total_chunks = (fb->len + max_payload - 1) / max_payload;
             
+            // Print every ~30 frames to avoid flooding REPL, but show it's working
+            if (frameCount++ % 30 == 0) {
+                Serial.printf("Sending frame: %u bytes in %u chunks\n", fb->len, total_chunks);
+            }
+            
             for (uint16_t i = 0; i < total_chunks; i++) {
-                uint8_t packet[1100];
-                
-                // --- 802.11 MAC Header (24 bytes) ---
-                packet[0] = 0x08; // Frame Control: Data frame (Subtype 0)
-                packet[1] = 0x00; // Flags
-                packet[2] = 0x00; // Duration
-                packet[3] = 0x00;
-                memcpy(&packet[4], pyControllerMac, 6);  // Addr1: Dest
-                memcpy(&packet[10], myMac, 6);           // Addr2: Src
-                memcpy(&packet[16], pyControllerMac, 6); // Addr3: BSSID
-                packet[22] = (raw_seq & 0x0F) << 4;      // Seq LSB
-                packet[23] = (raw_seq >> 4) & 0xFF;      // Seq MSB
-                raw_seq++;
-
-                // --- Custom Header (9 bytes) ---
-                packet[24] = 'C';
-                packet[25] = 'A';
-                packet[26] = 'M';
-                memcpy(&packet[27], &i, 2);
-                memcpy(&packet[29], &total_chunks, 2);
+                memcpy(&raw_packet[27], &i, 2);
+                memcpy(&raw_packet[29], &total_chunks, 2);
                 
                 int offset = i * max_payload;
                 uint16_t len = fb->len - offset;
                 if (len > max_payload) len = max_payload;
                 
-                memcpy(&packet[31], &len, 2);
-
-                // --- JPEG Data ---
-                memcpy(&packet[33], fb->buf + offset, len);
+                memcpy(&raw_packet[31], &len, 2);
+                memcpy(&raw_packet[33], fb->buf + offset, len);
                 
-                // Inject the packet directly to the baseband
-                esp_err_t err = esp_wifi_80211_tx(WIFI_IF_STA, packet, 33 + len, false);
+                // Inject raw 802.11 packet to achieve massive throughput increase
+                esp_err_t err = esp_wifi_80211_tx(WIFI_IF_STA, raw_packet, 33 + len, false);
                 if (err != ESP_OK) {
-                    delay(1); // Give buffers time to empty if we hit ESP_ERR_NO_MEM
-                    esp_wifi_80211_tx(WIFI_IF_STA, packet, 33 + len, false);
-                } else {
-                    delayMicroseconds(300); // Small 300us inter-packet gap to avoid overflowing receiver
+                    Serial.printf("Raw TX failed on chunk %d! Error: %d\n", i, err);
                 }
+                
+                // CRITICAL: Must use `delay()` (not delayMicroseconds) so the 
+                // FreeRTOS idle task can feed the watchdog and process the WiFi TX queue.
+                delay(2); 
             }
-            esp_camera_fb_return(fb);
+        } else {
+            Serial.println("Warning: Empty frame buffer captured.");
         }
+        
+        // ALWAYS return the frame buffer to prevent memory exhaustion
+        esp_camera_fb_return(fb);
     }
-    delay(10);
+    
+    delay(5);
 }
