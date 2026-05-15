@@ -31,6 +31,8 @@ volatile bool isConnected = false;
 volatile bool captureRequested = false;
 volatile bool is_streaming = false;
 
+static uint16_t seq_num = 0; // Added Sequence Number to satisfy the Wi-Fi driver
+
 // ----------------------------------------------------
 // ESP-NOW Receive Callback (Listens for Handshake / Controls)
 // ----------------------------------------------------
@@ -144,28 +146,33 @@ void loop() {
         camera_fb_t *fb = esp_camera_fb_get();
         if (fb) {
             uint8_t raw_packet[1400];
+            uint8_t bcast_mac[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
             
             // 802.11 MAC Header (24 bytes)
             raw_packet[0] = 0x08; // Data frame
             raw_packet[1] = 0x00;
             raw_packet[2] = 0x00; // Duration
             raw_packet[3] = 0x00;
-            memcpy(&raw_packet[4], pyControllerMac, 6);  // Addr1 (Dest)
-            memcpy(&raw_packet[10], cam_mac, 6);         // Addr2 (Src)
-            memcpy(&raw_packet[16], pyControllerMac, 6); // Addr3 (BSSID)
-            raw_packet[22] = 0x00; // Seq Ctrl
-            raw_packet[23] = 0x00;
-
-            // Custom Payload Header (Match PyController expectation)
-            raw_packet[24] = 'C';
-            raw_packet[25] = 'A';
-            raw_packet[26] = 'M';
             
-            // Maximum payload that comfortably fits in 802.11 frame
+            // CRITICAL FIX: Send to Broadcast MAC to bypass hardware ACK expectations and prevent TX Buffer exhaustion!
+            memcpy(&raw_packet[4], bcast_mac, 6);  // Addr1 (Dest)
+            memcpy(&raw_packet[10], cam_mac, 6);   // Addr2 (Src)
+            memcpy(&raw_packet[16], bcast_mac, 6); // Addr3 (BSSID)
+            
             int max_payload = 1300; 
             uint16_t total_chunks = (fb->len + max_payload - 1) / max_payload;
             
             for (uint16_t i = 0; i < total_chunks; i++) {
+                // Populate standard sequence number format
+                raw_packet[22] = (seq_num & 0x0F) << 4; 
+                raw_packet[23] = (seq_num >> 4) & 0xFF;
+                seq_num++;
+
+                // Custom Payload Header (Match PyController expectation)
+                raw_packet[24] = 'C';
+                raw_packet[25] = 'A';
+                raw_packet[26] = 'M';
+                
                 memcpy(&raw_packet[27], &i, 2);
                 memcpy(&raw_packet[29], &total_chunks, 2);
                 
@@ -176,15 +183,11 @@ void loop() {
                 memcpy(&raw_packet[31], &len, 2);
                 memcpy(&raw_packet[33], fb->buf + offset, len);
                 
-                // Inject raw 802.11 packet
-                // ESP_ERR_NO_MEM (257) occurs if the hardware Wi-Fi TX Ring Buffer is full.
                 esp_err_t err;
                 int retries = 0;
                 do {
                     err = esp_wifi_80211_tx(WIFI_IF_STA, raw_packet, 33 + len, false);
                     if (err != ESP_OK) {
-                        // Crucial: delay() yields CPU to the FreeRTOS Wi-Fi task to empty the TX buffer!
-                        // delayMicroseconds() blocks the CPU and causes the buffer to stay full forever.
                         delay(2); 
                         retries++;
                     }
@@ -194,11 +197,11 @@ void loop() {
                     Serial.printf("Raw TX completely failed on chunk %d! Error: %d\n", i, err);
                 }
 
-                // Small yield to prevent starving the Wi-Fi background task between successful chunks
+                // Micro yield to keep Wi-Fi task smooth
                 delay(1); 
             }
             esp_camera_fb_return(fb);
         }
     }
-    delay(5);
+    delay(1);
 }
