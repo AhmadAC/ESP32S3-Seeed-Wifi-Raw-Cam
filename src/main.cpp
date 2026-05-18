@@ -1,4 +1,3 @@
-// ESP32S3-Seeed-Wifi-Raw-Cam\src\main.cpp
 #include <Arduino.h>
 #include <WiFi.h>
 #include <esp_now.h>
@@ -130,51 +129,70 @@ void setup() {
     }
 }
 
-void loop() {
-    if ((captureRequested || is_streaming) && isConnected) {
-        captureRequested = false;
-        camera_fb_t *fb = esp_camera_fb_get();
-        if (fb) {
-            uint8_t raw_packet[1400];
-            
-            // 802.11 MAC Header (24 bytes)
-            raw_packet[0] = 0x08; // Data frame
-            raw_packet[1] = 0x00;
-            raw_packet[2] = 0x00; // Duration
-            raw_packet[3] = 0x00;
-            memcpy(&raw_packet[4], pyControllerMac, 6);  // Addr1 (Dest)
-            memcpy(&raw_packet[10], cam_mac, 6);         // Addr2 (Src)
-            memcpy(&raw_packet[16], pyControllerMac, 6); // Addr3 (BSSID)
-            raw_packet[22] = 0x00; // Seq Ctrl
-            raw_packet[23] = 0x00;
+// Helper function to keep the loop clean
+void send_raw_image(camera_fb_t *fb) {
+    uint8_t raw_packet[1400];
+    
+    // 802.11 MAC Header (24 bytes)
+    raw_packet[0] = 0x08; raw_packet[1] = 0x00;
+    raw_packet[2] = 0x00; raw_packet[3] = 0x00;
+    memcpy(&raw_packet[4], pyControllerMac, 6);  // Addr1 (Dest)
+    memcpy(&raw_packet[10], cam_mac, 6);         // Addr2 (Src)
+    memcpy(&raw_packet[16], pyControllerMac, 6); // Addr3 (BSSID)
+    raw_packet[22] = 0x00; raw_packet[23] = 0x00;
 
-            // Custom Payload Header (Match PyController expectation)
-            raw_packet[24] = 'C';
-            raw_packet[25] = 'A';
-            raw_packet[26] = 'M';
+    // Custom Payload Header (Match PyController expectation)
+    raw_packet[24] = 'C'; raw_packet[25] = 'A'; raw_packet[26] = 'M';
+    
+    // Maximum payload that comfortably fits in 802.11 frame
+    int max_payload = 1300; 
+    uint16_t total_chunks = (fb->len + max_payload - 1) / max_payload;
+    
+    for (uint16_t i = 0; i < total_chunks; i++) {
+        memcpy(&raw_packet[27], &i, 2);
+        memcpy(&raw_packet[29], &total_chunks, 2);
+        
+        int offset = i * max_payload;
+        uint16_t len = fb->len - offset;
+        if (len > max_payload) len = max_payload;
+        
+        memcpy(&raw_packet[31], &len, 2);
+        memcpy(&raw_packet[33], fb->buf + offset, len);
+        
+        // Inject raw 802.11 packet to achieve massive throughput increase over ESP-NOW
+        esp_wifi_80211_tx(WIFI_IF_STA, raw_packet, 33 + len, false);
+        
+        // Micro delay prevents Wi-Fi ring buffer overflow, while staying lightning fast
+        delayMicroseconds(1000); 
+    }
+}
+
+void loop() {
+    if (isConnected) {
+        if (captureRequested) {
+            captureRequested = false;
             
-            // Maximum payload that comfortably fits in 802.11 frame
-            int max_payload = 1300; 
-            uint16_t total_chunks = (fb->len + max_payload - 1) / max_payload;
+            // 1. Change to highest visual quality for the photo (lower number = less compression)
+            sensor_t * s = esp_camera_sensor_get();
+            if (s != NULL) s->set_quality(s, 6); 
+            delay(50); // Give the sensor a moment to apply the new setting
             
-            for (uint16_t i = 0; i < total_chunks; i++) {
-                memcpy(&raw_packet[27], &i, 2);
-                memcpy(&raw_packet[29], &total_chunks, 2);
-                
-                int offset = i * max_payload;
-                uint16_t len = fb->len - offset;
-                if (len > max_payload) len = max_payload;
-                
-                memcpy(&raw_packet[31], &len, 2);
-                memcpy(&raw_packet[33], fb->buf + offset, len);
-                
-                // Inject raw 802.11 packet to achieve massive throughput increase over ESP-NOW
-                esp_wifi_80211_tx(WIFI_IF_STA, raw_packet, 33 + len, false);
-                
-                // Micro delay prevents Wi-Fi ring buffer overflow, while staying lightning fast
-                delayMicroseconds(1000); 
+            camera_fb_t *fb = esp_camera_fb_get();
+            if (fb) {
+                send_raw_image(fb);
+                esp_camera_fb_return(fb);
             }
-            esp_camera_fb_return(fb);
+            
+            // 2. Revert to standard compressed quality for the live stream (prevents Wi-Fi lag)
+            if (s != NULL) s->set_quality(s, 12); 
+            
+        } else if (is_streaming) {
+            // Standard Live Stream Processing
+            camera_fb_t *fb = esp_camera_fb_get();
+            if (fb) {
+                send_raw_image(fb);
+                esp_camera_fb_return(fb);
+            }
         }
     }
     delay(5);
