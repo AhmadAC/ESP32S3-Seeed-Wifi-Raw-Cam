@@ -2,6 +2,7 @@
 #include <WiFi.h>
 #include <esp_now.h>
 #include <esp_wifi.h> // Required for esp_wifi_set_channel and esp_wifi_80211_tx
+#include <esp_idf_version.h>
 #include "esp_camera.h"
 
 // ----------------------------------------------------
@@ -32,8 +33,14 @@ volatile bool is_streaming = false;
 
 // ----------------------------------------------------
 // ESP-NOW Receive Callback (Listens for Handshake / Controls)
+// Supports both ESP-IDF v4.x and v5.x signatures (Arduino 2.x/3.x)
 // ----------------------------------------------------
+#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 0, 0)
+void onDataRecv(const esp_now_recv_info_t *info, const uint8_t *incomingData, int len) {
+    const uint8_t *mac = info->src_addr;
+#else
 void onDataRecv(const uint8_t *mac, const uint8_t *incomingData, int len) {
+#endif
     if (len >= 14 && strncmp((const char*)incomingData, "pyCAR_DISCOVER", 14) == 0) {
         if (!isConnected) {
             Serial.println("Received 'pyCAR_DISCOVER' via ESP-NOW!");

@@ -2,9 +2,9 @@ name: Compile Xiao ESP32S3 Firmware
 
 on:
   push:
-    branches: [ "espnow" ]
+    branches: [ "ESPWatchCam" ]
   pull_request:
-    branches: [ "espnow" ]
+    branches: [ "ESPWatchCam" ]
 
 jobs:
   build:
