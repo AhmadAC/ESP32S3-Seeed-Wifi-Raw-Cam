@@ -6,6 +6,7 @@
 #include <esp_idf_version.h>
 #include "esp_camera.h"
 #include <WebServer.h>
+#include <Preferences.h>
 
 // ----------------------------------------------------
 // Seeed Studio XIAO ESP32S3 Sense OV2640 Pinout
@@ -33,10 +34,11 @@ volatile bool isConnected = false;
 volatile bool captureRequested = false;
 volatile bool is_streaming = false;
 
-// State management for ESP-NOW and Access Point modes
+// State management for ESP-NOW and Wi-Fi networks
 enum SystemMode {
     MODE_WAITING,
     MODE_ESPNOW,
+    MODE_STA,
     MODE_AP
 };
 
@@ -53,81 +55,101 @@ static const char* _STREAM_CONTENT_TYPE = "multipart/x-mixed-replace;boundary=" 
 static const char* _STREAM_BOUNDARY = "\r\n--" PART_BOUNDARY "\r\n";
 static const char* _STREAM_PART = "Content-Type: image/jpeg\r\nContent-Length: %u\r\n\r\n";
 
+// Reusable flat JSON extractor for POST requests
+String getJsonValue(const String& json, const String& key) {
+    int keyIndex = json.indexOf("\"" + key + "\"");
+    if (keyIndex == -1) return "";
+    int colonIndex = json.indexOf(":", keyIndex);
+    if (colonIndex == -1) return "";
+    int startQuote = json.indexOf("\"", colonIndex);
+    if (startQuote == -1) return "";
+    int endQuote = json.indexOf("\"", startQuote + 1);
+    if (endQuote == -1) return "";
+    return json.substring(startQuote + 1, endQuote);
+}
+
 // HTML, CSS, and JS interface served to connected phones/devices
-const char INDEX_HTML[] PROGMEM = R"rawliteral(
-<!DOCTYPE html>
-<html>
-<head>
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>ESP32S3 Camera Stream</title>
-    <style>
-        body {
-            font-family: Arial, sans-serif;
-            background-color: #121212;
-            color: #ffffff;
-            text-align: center;
-            margin: 0;
-            padding: 20px;
-        }
-        h1 {
-            color: #00adb5;
-            margin-bottom: 20px;
-        }
-        .container {
-            max-width: 600px;
-            margin: 0 auto;
-            background-color: #1e1e1e;
-            padding: 20px;
-            border-radius: 10px;
-            box-shadow: 0 4px 10px rgba(0,0,0,0.5);
-        }
-        .stream-container {
-            width: 100%;
-            border-radius: 8px;
-            overflow: hidden;
-            background-color: #000;
-            margin-bottom: 20px;
-            position: relative;
-        }
-        img {
-            display: block;
-            width: 100%;
-            height: auto;
-        }
-        .btn {
-            background-color: #00adb5;
-            color: #ffffff;
-            border: none;
-            padding: 12px 24px;
-            font-size: 16px;
-            font-weight: bold;
-            border-radius: 5px;
-            cursor: pointer;
-            transition: background-color 0.3s ease;
-            box-shadow: 0 2px 5px rgba(0,0,0,0.3);
-        }
-        .btn:hover {
-            background-color: #007a80;
-        }
-        .btn:disabled {
-            background-color: #555555;
-            cursor: not-allowed;
-        }
-        .status-text {
-            margin-top: 10px;
-            color: #aaaaaa;
-            font-size: 14px;
-        }
-    </style>
+const char SETUP_HTML[] PROGMEM = R"raw_html(
+<!DOCTYPE html><html><head><meta charset="utf-8"><title>ESP Setup</title><meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+    :root { --primary: #0ea5e9; --bg: #0f172a; --card: #1e293b; --text: #f1f5f9; }
+    body { font-family: -apple-system, sans-serif; background: var(--bg); color: var(--text); padding: 15px; display: flex; flex-direction: column; align-items: center; min-height: 100vh; margin:0;}
+    .container { width: 100%; max-width: 420px; }
+    .card { background: var(--card); padding: 25px; border-radius: 20px; border: 1px solid #334155; text-align: center; margin-top: 15px; }
+    h2 { color: var(--primary); margin-top: 0; }
+    input, select { width: 100%; padding: 12px; margin: 8px 0 20px; border-radius: 10px; border: 1px solid #475569; background: #0f172a; color: white; box-sizing: border-box; }
+    button { width: 100%; padding: 15px; border: none; border-radius: 12px; font-weight: bold; cursor: pointer; color: white; margin-top:10px; transition: transform 0.1s; }
+    button:active { transform: scale(0.96); opacity: 0.9; }
+    .btn-green { background: #10b981; }
+    .btn-red { background: #ef4444; }
+    .btn-blue { background: #3b82f6; }
+    .status-bar { padding: 12px; border-radius: 10px; font-weight: bold; text-align: center; font-size: 0.85rem; border: 1px solid; text-transform: uppercase; background: #451a03; color: #fbbf24; border-color: #f59e0b; }
+</style></head>
+<body>
+    <div class="container">
+        <div class="status-bar">WIFI SETUP MODE</div>
+        <div class="card">
+            <h2>WiFi Setup</h2>
+            <div id="status-msg" style="font-size:0.8rem;color:#64748b;margin-bottom:5px">Ready to Scan</div>
+            <button class="btn-green" onclick="scan()">Scan Networks</button>
+            <select id="ssid" style="margin-top:10px;"><option value="">-- Select --</option></select>
+            <input type="password" id="pass" placeholder="Password">
+            <button class="btn-green" onclick="save()">Save and Reboot</button>
+            <button class="btn-blue" style="margin-top:15px;" onclick="location.href='/app'">Skip to Live Stream</button>
+            <button class="btn-red" style="margin-top:15px;" onclick="resetData()">Factory Reset Device</button>
+        </div>
+    </div>
+    <script>
+    function scan(){
+        document.getElementById('status-msg').innerText="Scanning...";
+        fetch('/scan').then(r=>r.json()).then(d=>{
+            const s=document.getElementById('ssid'); s.innerHTML='<option value="">-- Select --</option>';
+            d.forEach(n=>{let o=document.createElement('option');o.value=n;o.innerText=n;s.appendChild(o)});
+            document.getElementById('status-msg').innerText="Networks Found: " + d.length;
+        }).catch(()=>{ document.getElementById('status-msg').innerText="Scan Error"; });
+    }
+    function save(){
+        const s=document.getElementById('ssid').value, p=document.getElementById('pass').value;
+        if(!s) return alert('Select SSID');
+        fetch('/save', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ssid: s, pass: p}) })
+        .then(r=>r.text()).then(t=>{ alert('Saved! Rebooting...'); });
+    }
+    function resetData(){
+        if(confirm("Are you sure?")) fetch('/reset', { method: 'POST' }).then(() => alert('Resetting...'));
+    }
+    </script>
+</body></html>
+)raw_html";
+
+const char APP_HTML[] PROGMEM = R"raw_html(
+<!DOCTYPE html><html><head><meta charset="utf-8"><title>Camera Live Stream</title><meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+    :root { --primary: #0ea5e9; --bg: #0f172a; --card: #1e293b; --text: #f1f5f9; }
+    body { font-family: -apple-system, sans-serif; background: var(--bg); color: var(--text); padding: 15px; display: flex; flex-direction: column; align-items: center; min-height: 100vh; margin:0;}
+    .container { width: 100%; max-width: 600px; }
+    .card { background: var(--card); padding: 25px; border-radius: 20px; border: 1px solid #334155; text-align: center; margin-top: 15px; }
+    h1 { color: #00adb5; margin-bottom: 20px; }
+    .stream-container { width: 100%; border-radius: 8px; overflow: hidden; background-color: #000; margin-bottom: 20px; position: relative; }
+    img { display: block; width: 100%; height: auto; }
+    button { width: 100%; padding: 15px; border: none; border-radius: 12px; font-weight: bold; cursor: pointer; color: white; transition: transform 0.1s; }
+    button:active { transform: scale(0.96); opacity: 0.9; }
+    .btn-blue { background: #3b82f6; margin-top:10px; }
+    .btn-gray { background: #475569; }
+    .status-bar { padding: 12px; border-radius: 10px; font-weight: bold; text-align: center; font-size: 0.85rem; border: 1px solid; text-transform: uppercase; background: #172554; color: #93c5fd; border-color: #3b82f6; }
+    .status-text { margin-top: 10px; color: #aaaaaa; font-size: 14px; }
+</style>
 </head>
 <body>
     <div class="container">
-        <h1>ESP32S3 Camera Feed</h1>
-        <div class="stream-container">
-            <img src="/stream" alt="Live Stream">
+        <div class="status-bar">CAMERA LIVE STREAM</div>
+        <div class="card">
+            <div class="stream-container">
+                <img src="/stream" alt="Live Stream">
+            </div>
+            <button id="snapBtn" class="btn-blue" onclick="takeSnapshot()">Save Snapshot</button>
+            <div id="status" class="status-text">Streaming live...</div>
+            <button class="btn-gray" style="margin-top:20px; background:#0f172a; border:1px solid #475569;" onclick="location.href='/setup'">Go to Wi-Fi Setup</button>
         </div>
-        <button id="snapBtn" class="btn" onclick="takeSnapshot()">Save Snapshot</button>
-        <div id="status" class="status-text">Streaming live...</div>
     </div>
 
     <script>
@@ -166,13 +188,67 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
                 });
         }
     </script>
-</body>
-</html>
-)rawliteral";
+</body></html>
+)raw_html";
 
 // Web server request handlers
 void handleRoot() {
-    server.send(200, "text/html", INDEX_HTML);
+    server.sendHeader("Location", (currentMode == MODE_AP) ? "/setup" : "/app", true);
+    server.send(302, "text/plain", "");
+}
+
+void handleSetup() {
+    server.send(200, "text/html", SETUP_HTML);
+}
+
+void handleApp() {
+    server.send(200, "text/html", APP_HTML);
+}
+
+void handleScan() {
+    int n = WiFi.scanNetworks();
+    String json = "[";
+    for (int i = 0; i < n; ++i) {
+        json += "\"" + WiFi.SSID(i) + "\"";
+        if (i < n - 1) json += ",";
+    }
+    json += "]";
+    server.send(200, "application/json", json);
+}
+
+void handleSave() {
+    if (server.hasArg("plain")) {
+        String body = server.arg("plain");
+        String ssid = getJsonValue(body, "ssid");
+        String pass = getJsonValue(body, "pass");
+        
+        if (ssid.length() > 0) {
+            Preferences prefs;
+            prefs.begin("storage", false);
+            prefs.putString("wifi_ssid", ssid);
+            prefs.putString("wifi_pass", pass);
+            prefs.end();
+            Serial.println("Saved Wi-Fi credentials to NVS");
+            
+            server.send(200, "text/plain", "OK");
+            delay(1000);
+            ESP.restart();
+            return;
+        }
+    }
+    server.send(400, "text/plain", "Bad Request");
+}
+
+void handleReset() {
+    Preferences prefs;
+    prefs.begin("storage", false);
+    prefs.clear();
+    prefs.end();
+    Serial.println("NVS Erased. Factory reset complete.");
+    
+    server.send(200, "text/plain", "OK");
+    delay(1000);
+    ESP.restart();
 }
 
 void handleStream() {
@@ -203,34 +279,94 @@ void handleStream() {
 
 void handleCapture() {
     sensor_t * s = esp_camera_sensor_get();
-    if (s != NULL) s->set_quality(s, 6); 
-    delay(150); 
+    if (s != NULL) {
+        s->set_framesize(s, FRAMESIZE_UXGA); // Temporarily increase frame size to full 1600x1200
+        s->set_quality(s, 10);              // Boost image quality
+    }
+    
+    // Crucial step: Clear stale low-res frames in transit queue
+    for (int i = 0; i < 4; i++) {
+        camera_fb_t * fb = esp_camera_fb_get();
+        if (fb) {
+            esp_camera_fb_return(fb);
+        }
+        delay(30);
+    }
 
     camera_fb_t * fb = esp_camera_fb_get();
     if (!fb) {
         server.send(500, "text/plain", "Capture Failed");
-        if (s != NULL) s->set_quality(s, 14);
+        if (s != NULL) {
+            s->set_framesize(s, FRAMESIZE_QVGA);
+            s->set_quality(s, 14);
+        }
         return;
     }
 
-    server.setContentLength(fb->len);
     server.sendHeader("Content-Disposition", "attachment; filename=\"snapshot.jpg\"");
-    server.send(200, "image/jpeg", "");
-    
-    WiFiClient client = server.client();
-    client.write(fb->buf, fb->len);
+    server.send_P(200, "image/jpeg", (const char*)fb->buf, fb->len);
 
     esp_camera_fb_return(fb);
-    if (s != NULL) s->set_quality(s, 14);
+
+    // Revert camera settings back to low resolution for smooth live stream/ESP-NOW
+    if (s != NULL) {
+        s->set_framesize(s, FRAMESIZE_QVGA);
+        s->set_quality(s, 14);
+    }
 }
 
-// Function to transition and start Access Point Mode
-void setupAPMode() {
-    if (apStarted) return;
+// Set up server route maps
+void startWebServerHandlers() {
+    server.on("/", handleRoot);
+    server.on("/setup", handleSetup);
+    server.on("/app", handleApp);
+    server.on("/scan", handleScan);
+    server.on("/save", HTTP_POST, handleSave);
+    server.on("/reset", HTTP_POST, handleReset);
+    server.on("/stream", handleStream);
+    server.on("/capture", handleCapture);
+    server.begin();
+    Serial.println("Web server started.");
+}
+
+// Function to handle connection or AP setup
+void setupWiFi() {
+    Preferences prefs;
+    prefs.begin("storage", true);
+    String ssid = prefs.getString("wifi_ssid", "");
+    String pass = prefs.getString("wifi_pass", "");
+    prefs.end();
+
+    if (ssid.length() > 0) {
+        Serial.print("Connecting to saved Wi-Fi network: ");
+        Serial.println(ssid);
+        WiFi.mode(WIFI_STA);
+        WiFi.begin(ssid.c_str(), pass.c_str());
+        
+        // Wait up to 12 seconds for station connection
+        unsigned long startConnect = millis();
+        while (WiFi.status() != WL_CONNECTED && millis() - startConnect < 12000) {
+            delay(500);
+            Serial.print(".");
+        }
+        
+        if (WiFi.status() == WL_CONNECTED) {
+            Serial.println("\nSuccessfully connected to Wi-Fi!");
+            Serial.print("IP Address: ");
+            Serial.println(WiFi.localIP());
+            currentMode = MODE_STA;
+            startWebServerHandlers();
+            return;
+        } else {
+            Serial.println("\nConnection to router timed out.");
+        }
+    } else {
+        Serial.println("No saved Wi-Fi credentials found.");
+    }
     
-    Serial.println("No ESP-NOW peer found. Starting Access Point mode...");
-    
-    WiFi.mode(WIFI_AP_STA);
+    // Fallback to AP Mode
+    Serial.println("Starting fallback Access Point...");
+    WiFi.mode(WIFI_AP);
     
     IPAddress local_IP(192, 168, 4, 1);
     IPAddress gateway(192, 168, 4, 1);
@@ -238,17 +374,12 @@ void setupAPMode() {
     WiFi.softAPConfig(local_IP, gateway, subnet);
     
     WiFi.softAP("ESP32S3_CAM_AP", "");
-    
     Serial.print("AP IP Address: ");
     Serial.println(WiFi.softAPIP());
     
-    server.on("/", handleRoot);
-    server.on("/stream", handleStream);
-    server.on("/capture", handleCapture);
-    server.begin();
-    
-    Serial.println("Web server started.");
+    currentMode = MODE_AP;
     apStarted = true;
+    startWebServerHandlers();
 }
 
 // ----------------------------------------------------
@@ -334,11 +465,10 @@ void setup() {
     config.pin_pwdn     = PWDN_GPIO_NUM;
     config.pin_reset    = RESET_GPIO_NUM;
 
-    // CRITICAL FIX: Down-clocked to 10MHz. 20MHz overflows the camera's DMA FIFO buffer causing 
-    // it to randomly inject corrupt bytes into the JPEG, destroying the TJpgDec decoder on the controller.
+    // Allocate memory for high resolution frames from the start
     config.xclk_freq_hz = 10000000;
     config.pixel_format = PIXFORMAT_JPEG;
-    config.frame_size   = FRAMESIZE_QVGA; 
+    config.frame_size   = FRAMESIZE_UXGA; // Crucial for reserving memory block for high-res snapshots
     
     // Loosened compression slightly to ensure hardware consistency.
     config.jpeg_quality = 14; 
@@ -351,11 +481,12 @@ void setup() {
     }
     Serial.println("Camera initialized!");
 
-    // --- 3. Flip the Image Hardware-Side ---
+    // --- 3. Configure defaults and dynamic resolution ---
     sensor_t * s = esp_camera_sensor_get();
     if (s != NULL) {
         s->set_vflip(s, 1);   
         s->set_hmirror(s, 1); 
+        s->set_framesize(s, FRAMESIZE_QVGA); // Default back down to QVGA for light streaming
     }
 }
 
@@ -407,21 +538,20 @@ void send_raw_image(camera_fb_t *fb) {
 }
 
 void loop() {
-    // If waiting for a peer and timeout occurs, switch to Access Point mode
+    // If waiting for a peer and timeout occurs, setup local connection or start AP fallback
     if (currentMode == MODE_WAITING) {
         if (millis() - startWaitTime > ESPNOW_TIMEOUT_MS) {
-            currentMode = MODE_AP;
-            setupAPMode();
+            setupWiFi();
         }
     }
 
     if (currentMode == MODE_ESPNOW) {
-        // If an ESP-NOW peer is found, ensure AP mode is disabled
-        if (apStarted) {
+        // If ESP-NOW peer connects, ensure AP or station mode is turned off
+        if (apStarted || WiFi.getMode() != WIFI_STA) {
             WiFi.softAPdisconnect(true);
             WiFi.mode(WIFI_STA);
             apStarted = false;
-            Serial.println("ESP-NOW connected. Access Point disabled.");
+            Serial.println("ESP-NOW active. Access Point server disabled.");
         }
 
         if (isConnected) {
@@ -448,8 +578,8 @@ void loop() {
                 }
             }
         }
-    } else if (currentMode == MODE_AP) {
-        // Serve clients in AP Mode
+    } else if (currentMode == MODE_STA || currentMode == MODE_AP) {
+        // Handle incoming client requests in Router or AP Web Server mode
         server.handleClient();
     }
     
