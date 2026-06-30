@@ -7,6 +7,7 @@
 #include "esp_camera.h"
 #include <WebServer.h>
 #include <Preferences.h>
+#include <DNSServer.h>
 
 // ----------------------------------------------------
 // Seeed Studio XIAO ESP32S3 Sense OV2640 Pinout
@@ -48,6 +49,7 @@ const unsigned long ESPNOW_TIMEOUT_MS = 7000; // 7 seconds timeout to look for E
 bool apStarted = false;
 
 WebServer server(80);
+DNSServer dnsServer; // DNS server for Captive Portal
 
 // Boundary definitions for MJPEG Streaming
 #define PART_BOUNDARY "123456789000000000000987654321"
@@ -196,7 +198,7 @@ const char APP_HTML[] PROGMEM = R"raw_html(
 
 // Web server request handlers
 void handleRoot() {
-    server.sendHeader("Location", (currentMode == MODE_AP) ? "/setup" : "/app", true);
+    server.sendHeader("Location", (currentMode == MODE_AP) ? "http://192.168.4.1/setup" : "/app", true);
     server.send(302, "text/plain", "");
 }
 
@@ -208,13 +210,15 @@ void handleApp() {
     server.send(200, "text/html", APP_HTML);
 }
 
-// FIX: Gracefully catch 404s and automatically dismiss /favicon.ico spam in the serial console
+// Intercepts all OS connectivity checks seamlessly (silences "URI not found" warnings & triggers Captive Portal popup)
 void handleNotFound() {
     if (server.uri() == "/favicon.ico") {
         server.send(204, "image/x-icon", ""); // Empty response stops the browser from trying again
         return;
     }
-    server.send(404, "text/plain", "Not Found");
+    
+    server.sendHeader("Location", (currentMode == MODE_AP) ? "http://192.168.4.1/setup" : "/app", true);
+    server.send(302, "text/plain", "");
 }
 
 void handleScan() {
@@ -345,7 +349,7 @@ void startWebServerHandlers() {
     server.on("/stream", handleStream);
     server.on("/capture", handleCapture);
     
-    // Catch-all to elegantly dismiss missing routes and favicons
+    // Catch-all to elegantly dismiss missing routes and handle captive portal redirection
     server.onNotFound(handleNotFound);
     
     server.begin();
@@ -402,6 +406,9 @@ void setupWiFi() {
     WiFi.softAP("ESP32S3_CAM_AP", "");
     Serial.print("AP IP Address: ");
     Serial.println(WiFi.softAPIP());
+
+    // Start DNS server for captive portal interception (Port 53)
+    dnsServer.start(53, "*", WiFi.softAPIP());
     
     currentMode = MODE_AP;
     apStarted = true;
@@ -605,6 +612,11 @@ void loop() {
             }
         }
     } else if (currentMode == MODE_STA || currentMode == MODE_AP) {
+        // Run the DNS server strictly in AP mode to catch Android/iOS probe requests
+        if (currentMode == MODE_AP) {
+            dnsServer.processNextRequest();
+        }
+        
         // Handle incoming client requests in Router or AP Web Server mode
         server.handleClient();
     }
