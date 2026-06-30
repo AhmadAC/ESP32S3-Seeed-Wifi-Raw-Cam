@@ -102,7 +102,10 @@ const char SETUP_HTML[] PROGMEM = R"raw_html(
     <script>
     function scan(){
         document.getElementById('status-msg').innerText="Scanning...";
-        fetch('/scan').then(r=>r.json()).then(d=>{
+        fetch('/scan').then(r=>{
+            if(!r.ok) throw new Error("Server returned error");
+            return r.json();
+        }).then(d=>{
             const s=document.getElementById('ssid'); s.innerHTML='<option value="">-- Select --</option>';
             d.forEach(n=>{let o=document.createElement('option');o.value=n;o.innerText=n;s.appendChild(o)});
             document.getElementById('status-msg').innerText="Networks Found: " + d.length;
@@ -205,8 +208,24 @@ void handleApp() {
     server.send(200, "text/html", APP_HTML);
 }
 
+// FIX: Gracefully catch 404s and automatically dismiss /favicon.ico spam in the serial console
+void handleNotFound() {
+    if (server.uri() == "/favicon.ico") {
+        server.send(204, "image/x-icon", ""); // Empty response stops the browser from trying again
+        return;
+    }
+    server.send(404, "text/plain", "Not Found");
+}
+
 void handleScan() {
     int n = WiFi.scanNetworks();
+    
+    // FIX: Properly handle and return HTTP 500 if the scan fails, so the web UI catches it
+    if (n < 0) {
+        server.send(500, "text/plain", "Scan Failed");
+        return;
+    }
+    
     String json = "[";
     for (int i = 0; i < n; ++i) {
         json += "\"" + WiFi.SSID(i) + "\"";
@@ -325,6 +344,10 @@ void startWebServerHandlers() {
     server.on("/reset", HTTP_POST, handleReset);
     server.on("/stream", handleStream);
     server.on("/capture", handleCapture);
+    
+    // Catch-all to elegantly dismiss missing routes and favicons
+    server.onNotFound(handleNotFound);
+    
     server.begin();
     Serial.println("Web server started.");
 }
@@ -366,7 +389,10 @@ void setupWiFi() {
     
     // Fallback to AP Mode
     Serial.println("Starting fallback Access Point...");
-    WiFi.mode(WIFI_AP);
+    
+    // FIX: Set to WIFI_AP_STA (Access Point + Station). 
+    // Station mode MUST be active in the background for WiFi.scanNetworks() to successfully scan routers!
+    WiFi.mode(WIFI_AP_STA);
     
     IPAddress local_IP(192, 168, 4, 1);
     IPAddress gateway(192, 168, 4, 1);
