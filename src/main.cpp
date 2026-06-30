@@ -298,6 +298,26 @@ void streamTask(void *pvParameters) {
         WiFiClient client = streamServer.available();
         if (client) {
             Serial.println("Stream client connected on Port 81!");
+            
+            // FIX: Flush incoming HTTP GET request from browser before responding
+            boolean currentLineIsBlank = true;
+            unsigned long timeout = millis();
+            while (client.connected() && (millis() - timeout < 2000)) {
+                if (client.available()) {
+                    char c = client.read();
+                    if (c == '\n' && currentLineIsBlank) {
+                        break; // End of HTTP headers
+                    }
+                    if (c == '\n') {
+                        currentLineIsBlank = true;
+                    } else if (c != '\r') {
+                        currentLineIsBlank = false;
+                    }
+                }
+                vTaskDelay(1); // Yield to watchdog
+            }
+
+            // Now safely start the video stream response
             client.print("HTTP/1.1 200 OK\r\n");
             client.print("Content-Type: ");
             client.print(_STREAM_CONTENT_TYPE);
@@ -382,6 +402,13 @@ void startWebServerHandlers() {
     server.on("/save", HTTP_POST, handleSave);
     server.on("/reset", HTTP_POST, handleReset);
     server.on("/capture", handleCapture);
+    
+    // Catch common OS connectivity checks to prevent console errors
+    server.on("/generate_204", handleNotFound);
+    server.on("/gen_204", handleNotFound);
+    server.on("/hotspot-detect.html", handleNotFound);
+    server.on("/connecttest.txt", handleNotFound);
+    server.on("/ncsi.txt", handleNotFound);
     
     server.onNotFound(handleNotFound);
     server.begin();
