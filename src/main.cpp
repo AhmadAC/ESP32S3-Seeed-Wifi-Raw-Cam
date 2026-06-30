@@ -34,6 +34,7 @@ uint8_t cam_mac[6];
 volatile bool isConnected = false;
 volatile bool captureRequested = false;
 volatile bool is_streaming = false;
+volatile bool isCapturing = false; // Used to safely pause the stream during a snapshot
 
 // State management for ESP-NOW and Wi-Fi networks
 enum SystemMode {
@@ -49,6 +50,7 @@ const unsigned long ESPNOW_TIMEOUT_MS = 7000; // 7 seconds timeout to look for E
 bool apStarted = false;
 
 WebServer server(80);
+WiFiServer streamServer(81); // Dedicated stream server on Port 81 to prevent blocking Port 80
 DNSServer dnsServer; // DNS server for Captive Portal
 
 // Boundary definitions for MJPEG Streaming
@@ -134,7 +136,7 @@ const char APP_HTML[] PROGMEM = R"raw_html(
     .container { width: 100%; max-width: 600px; }
     .card { background: var(--card); padding: 25px; border-radius: 20px; border: 1px solid #334155; text-align: center; margin-top: 15px; }
     h1 { color: #00adb5; margin-bottom: 20px; }
-    .stream-container { width: 100%; border-radius: 8px; overflow: hidden; background-color: #000; margin-bottom: 20px; position: relative; }
+    .stream-container { width: 100%; border-radius: 8px; overflow: hidden; background-color: #000; margin-bottom: 20px; position: relative; min-height: 200px; }
     img { display: block; width: 100%; height: auto; }
     button { width: 100%; padding: 15px; border: none; border-radius: 12px; font-weight: bold; cursor: pointer; color: white; transition: transform 0.1s; }
     button:active { transform: scale(0.96); opacity: 0.9; }
@@ -149,7 +151,7 @@ const char APP_HTML[] PROGMEM = R"raw_html(
         <div class="status-bar">CAMERA LIVE STREAM</div>
         <div class="card">
             <div class="stream-container">
-                <img src="/stream" alt="Live Stream">
+                <img id="streamImg" alt="Live Stream">
             </div>
             <button id="snapBtn" class="btn-blue" onclick="takeSnapshot()">Save Snapshot</button>
             <div id="status" class="status-text">Streaming live...</div>
@@ -158,6 +160,9 @@ const char APP_HTML[] PROGMEM = R"raw_html(
     </div>
 
     <script>
+        // Connect to the dedicated Video Stream Server on Port 81
+        document.getElementById('streamImg').src = 'http://' + window.location.hostname + ':81/';
+
         function takeSnapshot() {
             const btn = document.getElementById('snapBtn');
             const status = document.getElementById('status');
@@ -189,6 +194,7 @@ const char APP_HTML[] PROGMEM = R"raw_html(
                 .catch(err => {
                     console.error(err);
                     status.innerText = "Error taking snapshot.";
+                    alert("Capture Error! Check Serial Monitor.");
                     btn.disabled = false;
                 });
         }
@@ -210,24 +216,33 @@ void handleApp() {
     server.send(200, "text/html", APP_HTML);
 }
 
-// Intercepts all OS connectivity checks seamlessly (silences "URI not found" warnings & triggers Captive Portal popup)
 void handleNotFound() {
     if (server.uri() == "/favicon.ico") {
-        server.send(204, "image/x-icon", ""); // Empty response stops the browser from trying again
+        server.send(204, "image/x-icon", ""); 
         return;
     }
-    
     server.sendHeader("Location", (currentMode == MODE_AP) ? "http://192.168.4.1/setup" : "/app", true);
     server.send(302, "text/plain", "");
 }
 
 void handleScan() {
-    int n = WiFi.scanNetworks();
+    Serial.println("Starting Wi-Fi scan...");
     
-    // FIX: Properly handle and return HTTP 500 if the scan fails, so the web UI catches it
+    // Explicitly disconnect STA interface to free up radio resources before scanning
+    WiFi.disconnect();
+    delay(100);
+    
+    int n = WiFi.scanNetworks(false, true); // Sync scan, show hidden
+    
     if (n < 0) {
+        Serial.println("Scan Failed! (Check if external antenna is attached!)");
         server.send(500, "text/plain", "Scan Failed");
         return;
+    }
+    
+    Serial.printf("Scan completed, found %d networks\n", n);
+    if (n == 0) {
+        Serial.println("WARNING: 0 networks found! If using a Seeed Studio XIAO, verify the antenna jumper is set correctly and the antenna is attached!");
     }
     
     String json = "[";
@@ -237,6 +252,7 @@ void handleScan() {
     }
     json += "]";
     server.send(200, "application/json", json);
+    WiFi.scanDelete(); // Clean up memory
 }
 
 void handleSave() {
@@ -274,71 +290,90 @@ void handleReset() {
     ESP.restart();
 }
 
-void handleStream() {
-    WiFiClient client = server.client();
-    client.print("HTTP/1.1 200 OK\r\n");
-    client.print("Content-Type: ");
-    client.print(_STREAM_CONTENT_TYPE);
-    client.print("\r\n\r\n");
+// Separate FreeRTOS Task to handle the MJPEG Video Stream
+// This prevents the video stream from permanently blocking the WebServer's ability to hear button clicks
+void streamTask(void *pvParameters) {
+    streamServer.begin();
+    while (true) {
+        WiFiClient client = streamServer.available();
+        if (client) {
+            Serial.println("Stream client connected on Port 81!");
+            client.print("HTTP/1.1 200 OK\r\n");
+            client.print("Content-Type: ");
+            client.print(_STREAM_CONTENT_TYPE);
+            client.print("\r\n");
+            client.print("Access-Control-Allow-Origin: *\r\n\r\n");
 
-    while (client.connected()) {
-        camera_fb_t * fb = esp_camera_fb_get();
-        if (!fb) {
-            delay(100);
-            continue;
+            while (client.connected()) {
+                // If the user clicks snapshot, pause the stream safely so they don't clash for memory
+                if (isCapturing) {
+                    delay(100);
+                    continue;
+                }
+
+                camera_fb_t * fb = esp_camera_fb_get();
+                if (!fb) {
+                    delay(50);
+                    continue;
+                }
+
+                client.print(_STREAM_BOUNDARY);
+                char buf[128];
+                int len = sprintf(buf, _STREAM_PART, fb->len);
+                client.write((const uint8_t *)buf, len);
+                client.write(fb->buf, fb->len);
+                client.print("\r\n");
+
+                esp_camera_fb_return(fb);
+                delay(60); // Stream pacing
+            }
+            client.stop();
+            Serial.println("Stream client disconnected.");
         }
-
-        client.print(_STREAM_BOUNDARY);
-        char buf[128];
-        int len = sprintf(buf, _STREAM_PART, fb->len);
-        client.write((const uint8_t *)buf, len);
-        client.write(fb->buf, fb->len);
-        client.print("\r\n");
-
-        esp_camera_fb_return(fb);
-        delay(60); // Stream pacing
+        delay(50);
     }
 }
 
 void handleCapture() {
+    Serial.println("Snapshot requested! Pausing stream...");
+    isCapturing = true; 
+    delay(200); // Give streamTask time to yield and pause
+    
     sensor_t * s = esp_camera_sensor_get();
     if (s != NULL) {
-        s->set_framesize(s, FRAMESIZE_UXGA); // Temporarily increase frame size to full 1600x1200
+        s->set_framesize(s, FRAMESIZE_UXGA); // Boost resolution for snapshot
         s->set_quality(s, 10);              // Boost image quality
     }
     
-    // Crucial step: Clear stale low-res frames in transit queue
-    for (int i = 0; i < 4; i++) {
+    // Crucial step: Clear stale low-res frames from the transit queue
+    for (int i = 0; i < 2; i++) {
         camera_fb_t * fb = esp_camera_fb_get();
-        if (fb) {
-            esp_camera_fb_return(fb);
-        }
-        delay(30);
+        if (fb) esp_camera_fb_return(fb);
     }
+    delay(200); // Wait for the sensor to expose a fresh high-res frame
 
     camera_fb_t * fb = esp_camera_fb_get();
     if (!fb) {
+        Serial.println("Capture Failed: Camera buffer returned NULL (Out of memory?)");
         server.send(500, "text/plain", "Capture Failed");
-        if (s != NULL) {
-            s->set_framesize(s, FRAMESIZE_QVGA);
-            s->set_quality(s, 14);
-        }
-        return;
+    } else {
+        Serial.printf("Snapshot Success! Size: %d bytes\n", fb->len);
+        server.sendHeader("Content-Disposition", "attachment; filename=\"snapshot.jpg\"");
+        server.sendHeader("Access-Control-Allow-Origin", "*");
+        server.send_P(200, "image/jpeg", (const char*)fb->buf, fb->len);
+        esp_camera_fb_return(fb);
     }
-
-    server.sendHeader("Content-Disposition", "attachment; filename=\"snapshot.jpg\"");
-    server.send_P(200, "image/jpeg", (const char*)fb->buf, fb->len);
-
-    esp_camera_fb_return(fb);
 
     // Revert camera settings back to low resolution for smooth live stream/ESP-NOW
     if (s != NULL) {
         s->set_framesize(s, FRAMESIZE_QVGA);
         s->set_quality(s, 14);
     }
+    
+    isCapturing = false;
+    Serial.println("Snapshot sequence complete. Resuming stream...");
 }
 
-// Set up server route maps
 void startWebServerHandlers() {
     server.on("/", handleRoot);
     server.on("/setup", handleSetup);
@@ -346,17 +381,17 @@ void startWebServerHandlers() {
     server.on("/scan", handleScan);
     server.on("/save", HTTP_POST, handleSave);
     server.on("/reset", HTTP_POST, handleReset);
-    server.on("/stream", handleStream);
     server.on("/capture", handleCapture);
     
-    // Catch-all to elegantly dismiss missing routes and handle captive portal redirection
     server.onNotFound(handleNotFound);
-    
     server.begin();
-    Serial.println("Web server started.");
+    
+    // Boot up the dedicated video streaming task on Core 1
+    xTaskCreatePinnedToCore(streamTask, "StreamTask", 4096, NULL, 1, NULL, 1);
+    
+    Serial.println("Web Server (Port 80) and Stream Server (Port 81) started.");
 }
 
-// Function to handle connection or AP setup
 void setupWiFi() {
     Preferences prefs;
     prefs.begin("storage", true);
@@ -364,13 +399,14 @@ void setupWiFi() {
     String pass = prefs.getString("wifi_pass", "");
     prefs.end();
 
+    // MUST enforce AP_STA mode so the board can simultaneously host the fallback AP AND scan for external routers
+    WiFi.mode(WIFI_AP_STA);
+
     if (ssid.length() > 0) {
         Serial.print("Connecting to saved Wi-Fi network: ");
         Serial.println(ssid);
-        WiFi.mode(WIFI_STA);
         WiFi.begin(ssid.c_str(), pass.c_str());
         
-        // Wait up to 12 seconds for station connection
         unsigned long startConnect = millis();
         while (WiFi.status() != WL_CONNECTED && millis() - startConnect < 12000) {
             delay(500);
@@ -391,12 +427,7 @@ void setupWiFi() {
         Serial.println("No saved Wi-Fi credentials found.");
     }
     
-    // Fallback to AP Mode
     Serial.println("Starting fallback Access Point...");
-    
-    // FIX: Set to WIFI_AP_STA (Access Point + Station). 
-    // Station mode MUST be active in the background for WiFi.scanNetworks() to successfully scan routers!
-    WiFi.mode(WIFI_AP_STA);
     
     IPAddress local_IP(192, 168, 4, 1);
     IPAddress gateway(192, 168, 4, 1);
@@ -407,7 +438,6 @@ void setupWiFi() {
     Serial.print("AP IP Address: ");
     Serial.println(WiFi.softAPIP());
 
-    // Start DNS server for captive portal interception (Port 53)
     dnsServer.start(53, "*", WiFi.softAPIP());
     
     currentMode = MODE_AP;
@@ -459,7 +489,6 @@ void setup() {
     Serial.begin(115200);
     delay(1000);
 
-    // ---  1. Wi-Fi & ESP-NOW Init ---
     WiFi.mode(WIFI_STA);
     WiFi.setSleep(false); 
     
@@ -474,10 +503,9 @@ void setup() {
     esp_now_register_recv_cb(onDataRecv);
     Serial.println("Waiting for PyController to broadcast 'pyCAR_DISCOVER'...");
     
-    // Save startup time reference to enforce fallback timeout
     startWaitTime = millis();
 
-    // --- 2. Camera Initialization ---
+    // --- Camera Initialization ---
     camera_config_t config;
     config.ledc_channel = LEDC_CHANNEL_0;
     config.ledc_timer   = LEDC_TIMER_0;
@@ -497,16 +525,24 @@ void setup() {
     config.pin_sccb_scl = SIOC_GPIO_NUM;
     config.pin_pwdn     = PWDN_GPIO_NUM;
     config.pin_reset    = RESET_GPIO_NUM;
-
-    // Allocate memory for high resolution frames from the start
     config.xclk_freq_hz = 10000000;
     config.pixel_format = PIXFORMAT_JPEG;
-    config.frame_size   = FRAMESIZE_UXGA; // Crucial for reserving memory block for high-res snapshots
-    
-    // Loosened compression slightly to ensure hardware consistency.
-    config.jpeg_quality = 14; 
-    config.fb_count     = 2;  
     config.grab_mode    = CAMERA_GRAB_LATEST;
+
+    // Detect if PSRAM is properly enabled. If yes, allocate high-res buffers. If no, fallback safely.
+    if (psramFound()) {
+        config.fb_location = CAMERA_FB_IN_PSRAM;
+        config.frame_size = FRAMESIZE_UXGA; // Crucial for reserving memory block for high-res snapshots
+        config.jpeg_quality = 10; 
+        config.fb_count = 2;
+        Serial.println("PSRAM found. High resolution UXGA enabled.");
+    } else {
+        config.fb_location = CAMERA_FB_IN_DRAM;
+        config.frame_size = FRAMESIZE_SVGA;
+        config.jpeg_quality = 12;
+        config.fb_count = 1;
+        Serial.println("WARNING: PSRAM NOT FOUND! Falling back to low resolution SVGA.");
+    }
 
     if (esp_camera_init(&config) != ESP_OK) {
         Serial.println("Camera Init Failed");
@@ -514,41 +550,32 @@ void setup() {
     }
     Serial.println("Camera initialized!");
 
-    // --- 3. Configure defaults and dynamic resolution ---
+    // Apply defaults
     sensor_t * s = esp_camera_sensor_get();
     if (s != NULL) {
         s->set_vflip(s, 1);   
         s->set_hmirror(s, 1); 
-        s->set_framesize(s, FRAMESIZE_QVGA); // Default back down to QVGA for light streaming
+        s->set_framesize(s, FRAMESIZE_QVGA); // Start low for smooth streaming
     }
 }
 
-// Helper function to keep the loop clean
+// Helper function for ESP-NOW PyController streams
 void send_raw_image(camera_fb_t *fb) {
     uint8_t raw_packet[1400];
-    
-    // Keeps a running sequence number for all sent frames
     static uint16_t seq_num = 0;
     
-    // 802.11 MAC Header (24 bytes)
     raw_packet[0] = 0x08; raw_packet[1] = 0x00;
     raw_packet[2] = 0x00; raw_packet[3] = 0x00;
-    memcpy(&raw_packet[4], pyControllerMac, 6);  // Addr1 (Dest)
-    memcpy(&raw_packet[10], cam_mac, 6);         // Addr2 (Src)
-    memcpy(&raw_packet[16], pyControllerMac, 6); // Addr3 (BSSID)
+    memcpy(&raw_packet[4], pyControllerMac, 6);  
+    memcpy(&raw_packet[10], cam_mac, 6);         
+    memcpy(&raw_packet[16], pyControllerMac, 6); 
 
-    // Custom Payload Header Setup
     raw_packet[24] = 'C'; raw_packet[25] = 'A'; raw_packet[26] = 'M';
     
     int max_payload = 1300; 
     uint16_t total_chunks = (fb->len + max_payload - 1) / max_payload;
     
     for (uint16_t i = 0; i < total_chunks; i++) {
-        
-        // CRITICAL FIX: Inject valid incrementing 802.11 Sequence Numbers!
-        // The Wi-Fi MAC layer natively filters out duplicate packets. If every packet
-        // carries a "0x0000" sequence number, the hardware intercepts it as a network re-transmission
-        // and randomly drops your chunks, breaking the JPEG formatting!
         uint16_t seq_ctrl = (seq_num++) << 4; 
         raw_packet[22] = seq_ctrl & 0xFF;
         raw_packet[23] = (seq_ctrl >> 8) & 0xFF;
@@ -564,14 +591,11 @@ void send_raw_image(camera_fb_t *fb) {
         memcpy(&raw_packet[33], fb->buf + offset, len);
         
         esp_wifi_80211_tx(WIFI_IF_STA, raw_packet, 33 + len, false);
-        
-        // Increased delay slightly to strictly enforce a safe streaming cadence 
         delayMicroseconds(2000); 
     }
 }
 
 void loop() {
-    // If waiting for a peer and timeout occurs, setup local connection or start AP fallback
     if (currentMode == MODE_WAITING) {
         if (millis() - startWaitTime > ESPNOW_TIMEOUT_MS) {
             setupWiFi();
@@ -579,7 +603,6 @@ void loop() {
     }
 
     if (currentMode == MODE_ESPNOW) {
-        // If ESP-NOW peer connects, ensure AP or station mode is turned off
         if (apStarted || WiFi.getMode() != WIFI_STA) {
             WiFi.softAPdisconnect(true);
             WiFi.mode(WIFI_STA);
@@ -612,12 +635,10 @@ void loop() {
             }
         }
     } else if (currentMode == MODE_STA || currentMode == MODE_AP) {
-        // Run the DNS server strictly in AP mode to catch Android/iOS probe requests
         if (currentMode == MODE_AP) {
             dnsServer.processNextRequest();
         }
         
-        // Handle incoming client requests in Router or AP Web Server mode
         server.handleClient();
     }
     
