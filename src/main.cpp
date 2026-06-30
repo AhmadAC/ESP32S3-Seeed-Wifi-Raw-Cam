@@ -1,7 +1,8 @@
+// ESP32S3-Seeed-Wifi-Raw-Cam/src/main.cpp
 #include <Arduino.h>
 #include <WiFi.h>
 #include <esp_now.h>
-#include <esp_wifi.h> // Required for esp_wifi_set_channel and esp_wifi_80211_tx
+#include <esp_wifi.h> 
 #include <esp_idf_version.h>
 #include "esp_camera.h"
 
@@ -32,8 +33,7 @@ volatile bool captureRequested = false;
 volatile bool is_streaming = false;
 
 // ----------------------------------------------------
-// ESP-NOW Receive Callback (Listens for Handshake / Controls)
-// Supports both ESP-IDF v4.x and v5.x signatures (Arduino 2.x/3.x)
+// ESP-NOW Receive Callback
 // ----------------------------------------------------
 #if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 0, 0)
 void onDataRecv(const esp_now_recv_info_t *info, const uint8_t *incomingData, int len) {
@@ -77,12 +77,9 @@ void setup() {
 
     // ---  1. Wi-Fi & ESP-NOW Init ---
     WiFi.mode(WIFI_STA);
-    WiFi.setSleep(false); // Disable sleep mode to prevent WiFi queuing/latency
+    WiFi.setSleep(false); 
     
-    // Use native ESP-IDF API to set the Wi-Fi channel securely
     esp_wifi_set_channel(1, WIFI_SECOND_CHAN_NONE);
-    
-    // Store camera MAC for raw packet injection
     esp_wifi_get_mac(WIFI_IF_STA, cam_mac);
     
     if (esp_now_init() != ESP_OK) {
@@ -114,10 +111,14 @@ void setup() {
     config.pin_pwdn     = PWDN_GPIO_NUM;
     config.pin_reset    = RESET_GPIO_NUM;
 
-    config.xclk_freq_hz = 20000000;
+    // CRITICAL FIX: Down-clocked to 10MHz. 20MHz overflows the camera's DMA FIFO buffer causing 
+    // it to randomly inject corrupt bytes into the JPEG, destroying the TJpgDec decoder on the controller.
+    config.xclk_freq_hz = 10000000;
     config.pixel_format = PIXFORMAT_JPEG;
     config.frame_size   = FRAMESIZE_QVGA; 
-    config.jpeg_quality = 12; 
+    
+    // Loosened compression slightly to ensure hardware consistency.
+    config.jpeg_quality = 14; 
     config.fb_count     = 2;  
     config.grab_mode    = CAMERA_GRAB_LATEST;
 
@@ -130,9 +131,8 @@ void setup() {
     // --- 3. Flip the Image Hardware-Side ---
     sensor_t * s = esp_camera_sensor_get();
     if (s != NULL) {
-        s->set_vflip(s, 1);   // 1 = Flip vertically
-        s->set_hmirror(s, 1); // 1 = Mirror horizontally
-        // Together, these rotate the camera stream exactly 180 degrees natively.
+        s->set_vflip(s, 1);   
+        s->set_hmirror(s, 1); 
     }
 }
 
@@ -140,22 +140,32 @@ void setup() {
 void send_raw_image(camera_fb_t *fb) {
     uint8_t raw_packet[1400];
     
+    // Keeps a running sequence number for all sent frames
+    static uint16_t seq_num = 0;
+    
     // 802.11 MAC Header (24 bytes)
     raw_packet[0] = 0x08; raw_packet[1] = 0x00;
     raw_packet[2] = 0x00; raw_packet[3] = 0x00;
     memcpy(&raw_packet[4], pyControllerMac, 6);  // Addr1 (Dest)
     memcpy(&raw_packet[10], cam_mac, 6);         // Addr2 (Src)
     memcpy(&raw_packet[16], pyControllerMac, 6); // Addr3 (BSSID)
-    raw_packet[22] = 0x00; raw_packet[23] = 0x00;
 
-    // Custom Payload Header (Match PyController expectation)
+    // Custom Payload Header Setup
     raw_packet[24] = 'C'; raw_packet[25] = 'A'; raw_packet[26] = 'M';
     
-    // Maximum payload that comfortably fits in 802.11 frame
     int max_payload = 1300; 
     uint16_t total_chunks = (fb->len + max_payload - 1) / max_payload;
     
     for (uint16_t i = 0; i < total_chunks; i++) {
+        
+        // CRITICAL FIX: Inject valid incrementing 802.11 Sequence Numbers!
+        // The Wi-Fi MAC layer natively filters out duplicate packets. If every packet
+        // carries a "0x0000" sequence number, the hardware intercepts it as a network re-transmission
+        // and randomly drops your chunks, breaking the JPEG formatting!
+        uint16_t seq_ctrl = (seq_num++) << 4; 
+        raw_packet[22] = seq_ctrl & 0xFF;
+        raw_packet[23] = (seq_ctrl >> 8) & 0xFF;
+
         memcpy(&raw_packet[27], &i, 2);
         memcpy(&raw_packet[29], &total_chunks, 2);
         
@@ -166,11 +176,10 @@ void send_raw_image(camera_fb_t *fb) {
         memcpy(&raw_packet[31], &len, 2);
         memcpy(&raw_packet[33], fb->buf + offset, len);
         
-        // Inject raw 802.11 packet to achieve massive throughput increase over ESP-NOW
         esp_wifi_80211_tx(WIFI_IF_STA, raw_packet, 33 + len, false);
         
-        // Micro delay prevents Wi-Fi ring buffer overflow, while staying lightning fast
-        delayMicroseconds(1000); 
+        // Increased delay slightly to strictly enforce a safe streaming cadence 
+        delayMicroseconds(2000); 
     }
 }
 
@@ -179,10 +188,9 @@ void loop() {
         if (captureRequested) {
             captureRequested = false;
             
-            // 1. Change to highest visual quality for the photo (lower number = less compression)
             sensor_t * s = esp_camera_sensor_get();
             if (s != NULL) s->set_quality(s, 6); 
-            delay(50); // Give the sensor a moment to apply the new setting
+            delay(50); 
             
             camera_fb_t *fb = esp_camera_fb_get();
             if (fb) {
@@ -190,11 +198,9 @@ void loop() {
                 esp_camera_fb_return(fb);
             }
             
-            // 2. Revert to standard compressed quality for the live stream (prevents Wi-Fi lag)
-            if (s != NULL) s->set_quality(s, 12); 
+            if (s != NULL) s->set_quality(s, 14); 
             
         } else if (is_streaming) {
-            // Standard Live Stream Processing
             camera_fb_t *fb = esp_camera_fb_get();
             if (fb) {
                 send_raw_image(fb);
