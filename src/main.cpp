@@ -530,9 +530,15 @@ void onDataRecv(const esp_now_recv_info_t *info, const uint8_t *incomingData, in
 #else
 void onDataRecv(const uint8_t *mac, const uint8_t *incomingData, int len) {
 #endif
-    if (len >= 14 && strncmp((const char*)incomingData, "pyCAR_DISCOVER", 14) == 0) {
-        if (!isConnected) {
-            Serial.println("Received 'pyCAR_DISCOVER' via ESP-NOW!");
+    if (len >= 14 && (strncmp((const char*)incomingData, "pyCAR_DISCOVER", 14) == 0 || strncmp((const char*)incomingData, "pyCAM_DISCOVER", 14) == 0)) {
+        if (!isConnected || memcmp(pyControllerMac, mac, 6) != 0) {
+            Serial.println("Received 'DISCOVER' via ESP-NOW! Registering Controller.");
+            
+            // Clean up the old controller MAC registration if we are forcibly updating it
+            if (isConnected && esp_now_is_peer_exist(pyControllerMac)) {
+                esp_now_del_peer(pyControllerMac);
+            }
+            
             memcpy(pyControllerMac, mac, 6);
             
             esp_now_peer_info_t peerInfo = {};
@@ -547,6 +553,7 @@ void onDataRecv(const uint8_t *mac, const uint8_t *incomingData, int len) {
             currentMode = MODE_ESPNOW;
         }
         
+        // Unconditionally send the ACK to ensure the controller sees us
         const char* ackMsg = "pyCAM_ACK";
         esp_now_send(pyControllerMac, (uint8_t *)ackMsg, strlen(ackMsg));
     } 
@@ -577,7 +584,7 @@ void setup() {
     }
 
     esp_now_register_recv_cb(onDataRecv);
-    Serial.println("Waiting for PyController to broadcast 'pyCAR_DISCOVER'...");
+    Serial.println("Waiting for PyController to broadcast 'pyCAR_DISCOVER' or 'pyCAM_DISCOVER'...");
     
     startWaitTime = millis();
 
