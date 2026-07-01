@@ -100,7 +100,13 @@ const char SETUP_HTML[] PROGMEM = R"raw_html(
             <input type="password" id="pass" placeholder="Password">
             <button class="btn-green" onclick="save()">Save and Reboot</button>
             <button class="btn-blue" style="margin-top:15px;" onclick="location.href='/app'">Skip to Live Stream</button>
-            <button class="btn-red" style="margin-top:15px;" onclick="resetData()">Factory Reset Device</button>
+            
+            <hr style="border-color:#334155; margin: 25px 0;">
+            <div style="font-size:0.85rem; color:#94a3b8; margin-bottom:10px;">Quick Boot Mode Switch</div>
+            <button style="background:#f59e0b;" onclick="forceAP()">Force AP Mode</button>
+            <button style="background:#10b981;" onclick="forceWiFi()">Use Saved Wi-Fi</button>
+            
+            <button class="btn-red" style="margin-top:25px;" onclick="resetData()">Factory Reset Device</button>
         </div>
     </div>
     <script>
@@ -120,6 +126,12 @@ const char SETUP_HTML[] PROGMEM = R"raw_html(
         if(!s) return alert('Select SSID');
         fetch('/save', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ssid: s, pass: p}) })
         .then(r=>r.text()).then(t=>{ alert('Saved! Rebooting...'); });
+    }
+    function forceAP(){
+        if(confirm("Switch to AP Mode and reboot?")) fetch('/switch_to_ap', { method: 'POST' }).then(() => alert('Rebooting...'));
+    }
+    function forceWiFi(){
+        if(confirm("Switch to Wi-Fi Mode and reboot?")) fetch('/switch_to_wifi', { method: 'POST' }).then(() => alert('Rebooting...'));
     }
     function resetData(){
         if(confirm("Are you sure?")) fetch('/reset', { method: 'POST' }).then(() => alert('Resetting...'));
@@ -155,7 +167,10 @@ const char APP_HTML[] PROGMEM = R"raw_html(
             </div>
             <button id="snapBtn" class="btn-blue" onclick="takeSnapshot()">Save Snapshot</button>
             <div id="status" class="status-text">Streaming live...</div>
-            <button class="btn-gray" style="margin-top:20px; background:#0f172a; border:1px solid #475569;" onclick="location.href='/setup'">Go to Wi-Fi Setup</button>
+            
+            <button class="btn-gray" style="margin-top:25px; background:#0f172a; border:1px solid #475569;" onclick="location.href='/setup'">Go to Wi-Fi Setup</button>
+            <button style="background:#f59e0b; margin-top:10px;" onclick="forceAP()">Force AP Mode</button>
+            <button style="background:#10b981; margin-top:10px;" onclick="forceWiFi()">Use Saved Wi-Fi</button>
         </div>
     </div>
 
@@ -197,6 +212,12 @@ const char APP_HTML[] PROGMEM = R"raw_html(
                     alert("Capture Error! Check Serial Monitor.");
                     btn.disabled = false;
                 });
+        }
+        function forceAP(){
+            if(confirm("Switch to AP Mode and reboot?")) fetch('/switch_to_ap', { method: 'POST' }).then(() => alert('Rebooting...'));
+        }
+        function forceWiFi(){
+            if(confirm("Switch to Wi-Fi Mode and reboot?")) fetch('/switch_to_wifi', { method: 'POST' }).then(() => alert('Rebooting...'));
         }
     </script>
 </body></html>
@@ -266,6 +287,7 @@ void handleSave() {
             prefs.begin("storage", false);
             prefs.putString("wifi_ssid", ssid);
             prefs.putString("wifi_pass", pass);
+            prefs.putBool("force_ap", false); // Auto-clear force AP mode when new credentials are saved
             prefs.end();
             Serial.println("Saved Wi-Fi credentials to NVS");
             
@@ -276,6 +298,28 @@ void handleSave() {
         }
     }
     server.send(400, "text/plain", "Bad Request");
+}
+
+void handleSwitchToAP() {
+    Preferences prefs;
+    prefs.begin("storage", false);
+    prefs.putBool("force_ap", true);
+    prefs.end();
+    Serial.println("Forcing AP Mode on next boot...");
+    server.send(200, "text/plain", "OK");
+    delay(1000);
+    ESP.restart();
+}
+
+void handleSwitchToWiFi() {
+    Preferences prefs;
+    prefs.begin("storage", false);
+    prefs.putBool("force_ap", false);
+    prefs.end();
+    Serial.println("Forcing Wi-Fi Mode on next boot...");
+    server.send(200, "text/plain", "OK");
+    delay(1000);
+    ESP.restart();
 }
 
 void handleReset() {
@@ -299,7 +343,7 @@ void streamTask(void *pvParameters) {
         if (client) {
             Serial.println("Stream client connected on Port 81!");
             
-            // FIX: Flush incoming HTTP GET request from browser before responding
+            // Flush incoming HTTP GET request from browser before responding
             boolean currentLineIsBlank = true;
             unsigned long timeout = millis();
             while (client.connected() && (millis() - timeout < 2000)) {
@@ -400,6 +444,8 @@ void startWebServerHandlers() {
     server.on("/app", handleApp);
     server.on("/scan", handleScan);
     server.on("/save", HTTP_POST, handleSave);
+    server.on("/switch_to_ap", HTTP_POST, handleSwitchToAP);
+    server.on("/switch_to_wifi", HTTP_POST, handleSwitchToWiFi);
     server.on("/reset", HTTP_POST, handleReset);
     server.on("/capture", handleCapture);
     
@@ -424,12 +470,13 @@ void setupWiFi() {
     prefs.begin("storage", true);
     String ssid = prefs.getString("wifi_ssid", "");
     String pass = prefs.getString("wifi_pass", "");
+    bool force_ap = prefs.getBool("force_ap", false);
     prefs.end();
 
     // MUST enforce AP_STA mode so the board can simultaneously host the fallback AP AND scan for external routers
     WiFi.mode(WIFI_AP_STA);
 
-    if (ssid.length() > 0) {
+    if (!force_ap && ssid.length() > 0) {
         Serial.print("Connecting to saved Wi-Fi network: ");
         Serial.println(ssid);
         WiFi.begin(ssid.c_str(), pass.c_str());
@@ -450,6 +497,8 @@ void setupWiFi() {
         } else {
             Serial.println("\nConnection to router timed out.");
         }
+    } else if (force_ap) {
+        Serial.println("AP Mode forced by user preference.");
     } else {
         Serial.println("No saved Wi-Fi credentials found.");
     }
